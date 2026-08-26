@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.database import session_scope
-from app.db.models import MonitoringRun, Position, Token, User, Wallet
+from app.db.models import MonitoringRun, Position, Token, User, Wallet, WalletTokenBalance
 from app.services.chain_client import ChainClient, TokenBalance
 from app.services.position_service import PositionService
 from app.services.transaction_parser import (
@@ -64,9 +64,36 @@ class MonitoringService:
         async with lock:
             return await self._scan_wallet_locked(wallet_id, reason)
 
+    async def refresh_wallet_balances(self, wallet_id: int) -> int:
+        with session_scope(self.session_factory) as session:
+            wallet = session.scalar(
+                select(Wallet).where(Wallet.id == wallet_id, Wallet.is_active.is_(True))
+            )
+            if not wallet:
+                return 0
+            chain = wallet.chain
+            address = wallet.address
+
+        native_balance = await self._get_native_balance(chain, address)
+        balances = await self.chain_client.get_token_balances(chain, address)
+
+        with session_scope(self.session_factory) as session:
+            wallet = session.scalar(
+                select(Wallet).where(Wallet.id == wallet_id, Wallet.is_active.is_(True))
+            )
+            if not wallet:
+                return 0
+            self._sync_balance_snapshots(
+                session,
+                wallet,
+                [native_balance] + balances if native_balance else balances,
+            )
+        return len(balances) + (1 if native_balance else 0)
+
     async def _scan_wallet_locked(self, wallet_id: int, reason: str) -> ScanResult:
         started_at = utc_now()
         result = ScanResult(wallet_id=wallet_id)
+        chat_id: int | None = None
         logger.info("Wallet Scan Start wallet_id=%s reason=%s", wallet_id, reason)
 
         with session_scope(self.session_factory) as session:
@@ -87,13 +114,27 @@ class MonitoringService:
                     result.error_message = "wallet_not_found_or_inactive"
                     return result
                 chat_id = wallet.user.telegram_chat_id
+                native_balance = await self._get_native_balance(wallet.chain, wallet.address)
                 balances = await self.chain_client.get_token_balances(wallet.chain, wallet.address)
-                transfers = await self.chain_client.get_token_transfers(
-                    wallet.chain,
-                    wallet.address,
-                    limit=self.settings.token_transfer_lookback_limit,
-                )
                 result.tokens_found = len(balances)
+                self._sync_balance_snapshots(
+                    session,
+                    wallet,
+                    [native_balance] + balances if native_balance else balances,
+                )
+                try:
+                    transfers = await self.chain_client.get_token_transfers(
+                        wallet.chain,
+                        wallet.address,
+                        limit=self.settings.token_transfer_lookback_limit,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Token transfer fetch failed wallet_id=%s; continuing with balances only: %s",
+                        wallet.id,
+                        exc,
+                    )
+                    transfers = []
                 events = parse_wallet_token_events(wallet.address, transfers)
 
                 position_service = PositionService(session)
@@ -111,12 +152,18 @@ class MonitoringService:
                     events,
                     result,
                 )
-                self._sync_open_positions_with_balances(
-                    session,
-                    wallet.id,
-                    balances_by_token,
-                    result,
-                )
+                if balances or events:
+                    self._sync_open_positions_with_balances(
+                        session,
+                        wallet.id,
+                        balances_by_token,
+                        result,
+                    )
+                elif position_service.list_open_positions_for_wallet(wallet.id):
+                    logger.warning(
+                        "Wallet Scan returned zero token balances; keeping existing open positions wallet_id=%s",
+                        wallet.id,
+                    )
                 wallet.last_scanned_at = utc_now()
 
             await self._send_scan_notifications(chat_id, result, reason)
@@ -125,6 +172,20 @@ class MonitoringService:
             logger.exception("Wallet Scan failed wallet_id=%s: %s", wallet_id, exc)
             result.error_message = str(exc)
             self._finish_run(wallet_id, started_at, "FAILED", result)
+            if chat_id and self.notifier:
+                try:
+                    await self.notifier(
+                        chat_id,
+                        "\n".join(
+                            [
+                                "⚠️ 钱包扫描失败",
+                                "",
+                                result.error_message,
+                            ]
+                        ),
+                    )
+                except Exception as notify_exc:
+                    logger.exception("Telegram Error failure notice failed: %s", notify_exc)
         logger.info(
             "Wallet Scan End wallet_id=%s tokens=%s created=%s updated=%s closed=%s",
             wallet_id,
@@ -134,6 +195,60 @@ class MonitoringService:
             result.positions_closed,
         )
         return result
+
+    async def _get_native_balance(
+        self, chain: str, wallet_address: str
+    ) -> TokenBalance | None:
+        try:
+            if hasattr(self.chain_client, "get_native_token_balance"):
+                return await self.chain_client.get_native_token_balance(chain, wallet_address)
+            amount = await self.chain_client.get_native_balance(chain, wallet_address)
+            return TokenBalance(
+                chain=chain,
+                contract_address="native",
+                symbol="ETH",
+                name="ETH",
+                decimals=18,
+                balance=amount,
+                is_native=True,
+            )
+        except Exception as exc:
+            logger.warning("Native balance fetch failed chain=%s: %s", chain, exc)
+            return None
+
+    def _sync_balance_snapshots(
+        self,
+        session,
+        wallet: Wallet,
+        balances: list[TokenBalance],
+    ) -> None:
+        checked_at = utc_now()
+        for balance in balances:
+            asset_key = "native" if balance.is_native else balance.contract_address
+            snapshot = session.scalar(
+                select(WalletTokenBalance).where(
+                    WalletTokenBalance.wallet_id == wallet.id,
+                    WalletTokenBalance.asset_key == asset_key,
+                )
+            )
+            if not snapshot:
+                snapshot = WalletTokenBalance(
+                    wallet_id=wallet.id,
+                    chain=wallet.chain,
+                    asset_key=asset_key,
+                    last_checked_at=checked_at,
+                )
+                session.add(snapshot)
+            snapshot.chain = wallet.chain
+            snapshot.contract_address = None if balance.is_native else balance.contract_address
+            snapshot.symbol = balance.symbol
+            snapshot.name = balance.name
+            snapshot.decimals = balance.decimals
+            snapshot.token_amount = balance.balance
+            snapshot.exchange_rate_usd = balance.exchange_rate_usd
+            snapshot.usd_value = balance.usd_value
+            snapshot.is_native = balance.is_native
+            snapshot.last_checked_at = checked_at
 
     async def _apply_events(
         self,

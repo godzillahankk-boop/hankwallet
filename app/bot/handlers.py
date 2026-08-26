@@ -31,9 +31,9 @@ from app.bot.messages import (
     ADD_WALLET_PROMPT,
     SETTINGS_MESSAGE,
     START_MESSAGE,
+    balances_message,
     duplicate_wallet_message,
     invalid_wallet_message,
-    positions_message,
     scan_done_message,
     wallet_added_message,
     wallet_list_message,
@@ -41,8 +41,8 @@ from app.bot.messages import (
 from app.core.config import Settings
 from app.db.database import session_scope
 from app.db.models import User, Wallet
+from app.services.balance_service import BalanceService
 from app.services.monitoring_service import MonitoringService
-from app.services.position_service import PositionService
 from app.services.wallet_service import WalletService
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,7 @@ def build_application(
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_SCAN}$"), manual_scan))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_SETTINGS}$"), settings_message))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_BACK}$"), back_to_main))
+    application.add_error_handler(error_handler)
     return application
 
 
@@ -189,13 +190,67 @@ async def delete_wallet_finish(update: Update, context: ContextTypes.DEFAULT_TYP
 async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
+    settings: Settings = context.application.bot_data["settings"]
     session_factory = context.application.bot_data["session_factory"]
+    monitoring_service: MonitoringService = context.application.bot_data[
+        "monitoring_service"
+    ]
+    wallet_ids: list[int] = []
+    balances = []
+    stale_wallet_ids: list[int] = []
     with session_scope(session_factory) as session:
-        positions = PositionService(session).list_user_open_positions(update.effective_user.id)
-        for position in positions:
-            position.token
-        text = positions_message(positions)
+        user = session.scalar(
+            select(User).where(User.telegram_user_id == update.effective_user.id)
+        )
+        if user:
+            wallet_ids = list(
+                session.scalars(
+                    select(Wallet.id).where(
+                        Wallet.user_id == user.id, Wallet.is_active.is_(True)
+                    )
+                )
+            )
+        balance_service = BalanceService(session)
+        balances = balance_service.list_user_balances(update.effective_user.id)
+        stale_wallet_ids = [
+            wallet_id
+            for wallet_id in wallet_ids
+            if not balance_service.wallet_has_recent_snapshot(
+                wallet_id,
+                max(settings.wallet_scan_interval_seconds * 2, 120),
+            )
+        ]
+    if balances:
+        text = balances_message(balances)
+        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+        for wallet_id in stale_wallet_ids:
+            context.application.create_task(
+                _refresh_wallet_balances_safely(monitoring_service, wallet_id)
+            )
+        return
+    for wallet_id in wallet_ids:
+        try:
+            await monitoring_service.refresh_wallet_balances(wallet_id)
+        except Exception as exc:
+            logger.exception("Wallet balance refresh failed wallet_id=%s: %s", wallet_id, exc)
+            await update.message.reply_text(
+                "\n".join(["⚠️ 持仓刷新失败", "", str(exc)]),
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+    with session_scope(session_factory) as session:
+        balances = BalanceService(session).list_user_balances(update.effective_user.id)
+        text = balances_message(balances)
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+
+
+async def _refresh_wallet_balances_safely(
+    monitoring_service: MonitoringService, wallet_id: int
+) -> None:
+    try:
+        await monitoring_service.refresh_wallet_balances(wallet_id)
+    except Exception as exc:
+        logger.exception("Wallet background balance refresh failed wallet_id=%s: %s", wallet_id, exc)
 
 
 async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -233,6 +288,12 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     created = updated_count = closed = 0
     for wallet_id in wallet_ids:
         result = await monitoring_service.scan_wallet(wallet_id, reason="manual")
+        if result.error_message:
+            await update.message.reply_text(
+                "\n".join(["⚠️ 钱包扫描失败", "", result.error_message]),
+                reply_markup=main_menu_keyboard(),
+            )
+            return
         created += result.positions_created
         updated_count += result.positions_updated
         closed += result.positions_closed
@@ -252,3 +313,12 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if update.message:
         await update.message.reply_text(START_MESSAGE, reply_markup=main_menu_keyboard())
     return ConversationHandler.END
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Telegram update error", exc_info=context.error)
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text(
+            "⚠️ 系统处理失败，请稍后再试。",
+            reply_markup=main_menu_keyboard(),
+        )

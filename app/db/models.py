@@ -100,6 +100,29 @@ class Position(Base):
     )
 
 
+class WalletTokenBalance(Base):
+    __tablename__ = "wallet_token_balances"
+    __table_args__ = (UniqueConstraint("wallet_id", "asset_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), nullable=False)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    asset_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    contract_address: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    decimals: Mapped[int] = mapped_column(Integer, default=18, nullable=False)
+    token_amount: Mapped[float] = mapped_column(Numeric(38, 18), nullable=False, default=0)
+    exchange_rate_usd: Mapped[Optional[float]] = mapped_column(Numeric(24, 10), nullable=True)
+    usd_value: Mapped[Optional[float]] = mapped_column(Numeric(24, 8), nullable=True)
+    is_native: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_checked_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class PositionTransaction(Base):
     __tablename__ = "position_transactions"
     __table_args__ = (UniqueConstraint("position_id", "tx_hash", "tx_type"),)

@@ -30,3 +30,6 @@ def setup_logging(log_level: str) -> None:
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
+    # httpx includes full Telegram Bot API URLs at INFO level, including the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)

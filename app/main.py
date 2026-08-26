@@ -38,6 +38,8 @@ async def run() -> None:
     chain_client = build_chain_client(
         settings.chain_api_base_url,
         settings.chain_api_key,
+        settings.chain_rpc_url,
+        settings.chain_token_search_symbols,
         settings.chain_request_timeout_seconds,
     )
 
@@ -87,4 +89,3 @@ async def run() -> None:
 
 def main() -> None:
     asyncio.run(run())
-

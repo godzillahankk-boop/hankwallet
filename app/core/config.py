@@ -18,6 +18,8 @@ class Settings:
     default_chain: str
     chain_api_base_url: str | None
     chain_api_key: str | None
+    chain_rpc_url: str | None
+    chain_token_search_symbols: tuple[str, ...]
     chain_request_timeout_seconds: int
     token_transfer_lookback_limit: int
     log_level: str
@@ -49,10 +51,15 @@ def load_settings() -> Settings:
         default_chain=os.getenv("DEFAULT_CHAIN", "ethereum").lower(),
         chain_api_base_url=os.getenv("CHAIN_API_BASE_URL") or None,
         chain_api_key=os.getenv("CHAIN_API_KEY") or None,
+        chain_rpc_url=os.getenv("CHAIN_RPC_URL") or None,
+        chain_token_search_symbols=tuple(
+            symbol.strip()
+            for symbol in os.getenv("CHAIN_TOKEN_SEARCH_SYMBOLS", "").split(",")
+            if symbol.strip()
+        ),
         chain_request_timeout_seconds=_get_int("CHAIN_REQUEST_TIMEOUT_SECONDS", 20),
         token_transfer_lookback_limit=_get_int("TOKEN_TRANSFER_LOOKBACK_LIMIT", 100),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         api_host=os.getenv("API_HOST", "127.0.0.1"),
         api_port=_get_int("API_PORT", 8000),
     )
-

@@ -13,6 +13,7 @@ QUOTE_TOKEN_SYMBOLS = {
     "WETH",
     "USDC",
     "USDT",
+    "USDG",
     "DAI",
     "WBTC",
 }
@@ -126,4 +127,3 @@ def _event(
         block_number=transfer.block_number,
         tx_timestamp=transfer.timestamp,
     )
-

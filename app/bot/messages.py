@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from app.db.models import Position, Wallet
+from app.db.models import Position, Wallet, WalletTokenBalance
 from app.utils.address import short_address
 
 
@@ -56,6 +56,20 @@ def positions_message(positions: list[Position]) -> str:
     return "\n".join(lines).strip()
 
 
+def balances_message(balances: list[WalletTokenBalance]) -> str:
+    if not balances:
+        return NO_POSITIONS_MESSAGE
+    lines = ["💼 当前持仓", ""]
+    for balance in balances:
+        symbol = balance.symbol or short_address(balance.contract_address or balance.asset_key)
+        lines.append(f"🟢 {symbol}")
+        lines.append(format_amount(Decimal(str(balance.token_amount or '0'))))
+        if balance.usd_value:
+            lines.append(f"${format_amount(Decimal(str(balance.usd_value)))}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def scan_done_message(created: int, updated: int, closed: int) -> str:
     return "\n".join(
         [
@@ -69,11 +83,13 @@ def scan_done_message(created: int, updated: int, closed: int) -> str:
 
 
 def format_amount(amount: Decimal) -> str:
-    normalized = amount.normalize()
+    if amount == 0:
+        return "0"
+    quantum = Decimal("0.000000000001")
+    normalized = amount.quantize(quantum).normalize()
     text = f"{normalized:f}"
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     int_part, _, frac_part = text.partition(".")
     grouped = f"{int(int_part):,}" if int_part not in {"", "-"} else int_part
     return f"{grouped}.{frac_part}" if frac_part else grouped
-

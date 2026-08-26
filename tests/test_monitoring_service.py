@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.core.config import Settings
 from app.db.database import init_db, make_engine, make_session_factory, session_scope
-from app.db.models import Position, PositionTransaction, User, Wallet
+from app.db.models import Position, PositionTransaction, User, Wallet, WalletTokenBalance
 from app.services.chain_client import ChainTransaction, TokenBalance, TokenTransfer
 from app.services.monitoring_service import MonitoringService
 from app.services.wallet_service import WalletService
@@ -24,6 +24,7 @@ DUST = "0x5555555555555555555555555555555555555555"
 class FakeChainClient:
     balances: list[TokenBalance] = field(default_factory=list)
     transfers: list[TokenTransfer] = field(default_factory=list)
+    fail_transfers: bool = False
 
     async def get_native_balance(self, chain: str, wallet_address: str) -> Decimal:
         return Decimal("0")
@@ -36,6 +37,8 @@ class FakeChainClient:
     async def get_token_transfers(
         self, chain: str, wallet_address: str, limit: int = 100
     ) -> list[TokenTransfer]:
+        if self.fail_transfers:
+            raise RuntimeError("transfer_api_down")
         return self.transfers[:limit]
 
     async def get_transaction(self, chain: str, tx_hash: str) -> ChainTransaction | None:
@@ -59,6 +62,8 @@ def settings(tmp_path) -> Settings:
         default_chain="ethereum",
         chain_api_base_url=None,
         chain_api_key=None,
+        chain_rpc_url=None,
+        chain_token_search_symbols=(),
         chain_request_timeout_seconds=20,
         token_transfer_lookback_limit=100,
         log_level="INFO",
@@ -229,3 +234,20 @@ async def test_dust_transfer_in_does_not_create_open_position(tmp_path) -> None:
         assert open_positions == []
         assert len(ignored_positions) == 1
 
+
+@pytest.mark.asyncio
+async def test_transfer_failure_keeps_scan_successful_and_updates_balance_snapshot(tmp_path) -> None:
+    chain = FakeChainClient([balance(FOMA, "FOMA", "1000")], fail_transfers=True)
+    service, session_factory, wallet_id = make_service(tmp_path, chain)
+
+    result = await service.scan_wallet(wallet_id, reason="test")
+
+    assert result.error_message is None
+    assert result.tokens_found == 1
+    with session_scope(session_factory) as session:
+        snapshot = session.scalar(
+            select(WalletTokenBalance).where(WalletTokenBalance.contract_address == FOMA)
+        )
+        assert snapshot is not None
+        assert snapshot.symbol == "FOMA"
+        assert Decimal(str(snapshot.token_amount)) == Decimal("1000")
