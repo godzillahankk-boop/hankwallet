@@ -53,6 +53,11 @@ CHAIN_API_KEY=你的 Blockscout Pro API Key
 CHAIN_RPC_URL=https://rpc.mainnet.chain.robinhood.com/
 CHAIN_TOKEN_SEARCH_SYMBOLS=DTF
 TOKEN_TRANSFER_LOOKBACK_LIMIT=500
+
+GMGN_ENABLED=false
+GMGN_API_BASE_URL=https://openapi.gmgn.ai
+GMGN_API_KEY=
+GMGN_PRIVATE_KEY_PATH=
 ```
 
 Robinhood Chain 主网使用：
@@ -76,6 +81,27 @@ Robinhood Chain 上 Blockscout 的余额索引可能滞后，项目会用 `CHAIN
 - `/api/v2/transactions/{tx_hash}`
 
 如果你的数据源字段不同，只需要替换 `app/services/chain_client.py` 的适配器，业务扫描逻辑不用改。
+
+## GMGN 数据源验证
+
+当前 GMGN 只作为新增数据源和验证来源，不会接管现有 Position / PnL，也不会调用任何交易接口。
+
+已封装的只读接口：
+
+- `GET /v1/user/wallet_holdings`
+- `GET /v1/user/wallet_activity`
+- `GET /v1/user/wallet_stats`
+- `GET /v1/user/wallet_token_balance`
+
+`wallet_activity` 和 `wallet_stats` 使用 GMGN API Key；`wallet_holdings` 根据 GMGN CLI 当前实现需要 signing key 签名。Signing key 是 GMGN API 请求签名密钥，不是链上钱包私钥。
+
+诊断脚本：
+
+```bash
+python scripts/gmgn_probe.py 0x...
+```
+
+脚本只读取 GMGN 和 Robinhood RPC/Blockscout 数据，不修改数据库。
 
 ## 启动
 

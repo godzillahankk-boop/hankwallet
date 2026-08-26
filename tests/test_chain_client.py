@@ -6,6 +6,55 @@ from app.services.chain_client import BlockscoutChainClient
 
 
 @pytest.mark.asyncio
+async def test_native_balance_prefers_rpc_without_blockscout(monkeypatch) -> None:
+    client = BlockscoutChainClient("https://example.test", rpc_url="https://rpc.example.test")
+
+    async def fake_get(path, params=None):
+        raise AssertionError("Blockscout API must not be used when RPC native balance is available")
+
+    async def fake_rpc(method, params):
+        assert method == "eth_getBalance"
+        return hex(186549321218685747)
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    monkeypatch.setattr(client, "_rpc", fake_rpc)
+
+    balance = await client.get_native_balance(
+        "robinhood",
+        "0x0e712f06daeab2e866b1477923764af2fc1a9f67",
+    )
+
+    assert balance == Decimal("0.186549321218685747")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_rpc_erc20_balance_does_not_use_blockscout(monkeypatch) -> None:
+    client = BlockscoutChainClient("https://example.test", rpc_url="https://rpc.example.test")
+
+    async def fake_get(path, params=None):
+        raise AssertionError("Blockscout API must not be used for direct ERC20 RPC balance")
+
+    async def fake_rpc(method, params):
+        assert method == "eth_call"
+        assert params[0]["to"] == "0x8ad5a580c4215086dec828d8626b95a06d7d00cc"
+        return hex(249045742548186937738568)
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    monkeypatch.setattr(client, "_rpc", fake_rpc)
+
+    balance = await client.get_erc20_token_balance(
+        "robinhood",
+        "0x0e712f06daeab2e866b1477923764af2fc1a9f67",
+        "0x8ad5a580c4215086dec828d8626b95a06d7d00cc",
+        18,
+    )
+
+    assert balance.balance == Decimal("249045.742548186937738568")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_blockscout_token_balance_accepts_address_hash(monkeypatch) -> None:
     client = BlockscoutChainClient("https://example.test")
 

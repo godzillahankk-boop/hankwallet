@@ -69,6 +69,11 @@ def settings(tmp_path) -> Settings:
         log_level="INFO",
         api_host="127.0.0.1",
         api_port=8000,
+        gmgn_enabled=False,
+        gmgn_api_base_url="https://openapi.gmgn.ai",
+        gmgn_api_key=None,
+        gmgn_private_key_path=None,
+        gmgn_request_timeout_seconds=20,
     )
 
 

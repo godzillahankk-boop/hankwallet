@@ -25,6 +25,11 @@ class Settings:
     log_level: str
     api_host: str
     api_port: int
+    gmgn_enabled: bool
+    gmgn_api_base_url: str
+    gmgn_api_key: str | None
+    gmgn_private_key_path: str | None
+    gmgn_request_timeout_seconds: int
 
 
 def _get_int(name: str, default: int) -> int:
@@ -39,7 +44,15 @@ def _get_decimal(name: str, default: str) -> Decimal:
     return Decimal(raw if raw else default)
 
 
+def _get_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def load_settings() -> Settings:
+    load_dotenv(os.path.expanduser("~/.config/gmgn/.env"), override=False)
     load_dotenv()
     return Settings(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -62,4 +75,9 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         api_host=os.getenv("API_HOST", "127.0.0.1"),
         api_port=_get_int("API_PORT", 8000),
+        gmgn_enabled=_get_bool("GMGN_ENABLED", False),
+        gmgn_api_base_url=os.getenv("GMGN_API_BASE_URL", "https://openapi.gmgn.ai"),
+        gmgn_api_key=os.getenv("GMGN_API_KEY") or None,
+        gmgn_private_key_path=os.getenv("GMGN_PRIVATE_KEY_PATH") or None,
+        gmgn_request_timeout_seconds=_get_int("GMGN_REQUEST_TIMEOUT_SECONDS", 20),
     )

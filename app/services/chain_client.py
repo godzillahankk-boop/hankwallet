@@ -64,6 +64,15 @@ class ChainClient(Protocol):
     async def get_native_balance(self, chain: str, wallet_address: str) -> Decimal:
         ...
 
+    async def get_erc20_token_balance(
+        self,
+        chain: str,
+        wallet_address: str,
+        token_address: str,
+        decimals: int | None = None,
+    ) -> TokenBalance:
+        ...
+
     async def get_token_balances(
         self, chain: str, wallet_address: str
     ) -> list[TokenBalance]:
@@ -103,7 +112,36 @@ class BlockscoutChainClient:
         self.max_pages = 10
 
     async def get_native_balance(self, chain: str, wallet_address: str) -> Decimal:
+        if self.rpc_url:
+            raw_balance = await self._rpc("eth_getBalance", [wallet_address, "latest"])
+            return self._scale_hex_decimal(raw_balance, 18)
         return (await self.get_native_token_balance(chain, wallet_address)).balance
+
+    async def get_erc20_token_balance(
+        self,
+        chain: str,
+        wallet_address: str,
+        token_address: str,
+        decimals: int | None = None,
+    ) -> TokenBalance:
+        if not self.rpc_url:
+            raise ChainClientConfigurationError("CHAIN_RPC_URL is not configured")
+        contract = normalize_evm_address(token_address)
+        resolved_decimals = decimals
+        if resolved_decimals is None:
+            resolved_decimals = await self._get_token_decimals(contract)
+        raw = await self._rpc(
+            "eth_call",
+            [{"to": contract, "data": self._balance_of_call_data(wallet_address)}, "latest"],
+        )
+        return TokenBalance(
+            chain=chain,
+            contract_address=contract,
+            symbol=None,
+            name=None,
+            decimals=resolved_decimals,
+            balance=self._scale_hex_decimal(raw, resolved_decimals),
+        )
 
     async def get_native_token_balance(
         self, chain: str, wallet_address: str
