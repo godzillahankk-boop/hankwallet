@@ -5,6 +5,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -156,3 +157,58 @@ class MonitoringRun(Base):
     positions_updated: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     positions_closed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class PriceSnapshot(Base):
+    __tablename__ = "price_snapshots"
+    __table_args__ = (
+        Index("ix_price_snapshots_wallet_token_observed", "wallet_id", "token_address", "observed_at"),
+        Index("ix_price_snapshots_observed_at", "observed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), nullable=False)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    price_usd: Mapped[float] = mapped_column(Numeric(38, 18), nullable=False)
+    balance: Mapped[float] = mapped_column(Numeric(38, 18), nullable=False)
+    usd_value: Mapped[Optional[float]] = mapped_column(Numeric(24, 8), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class PriceAlertState(Base):
+    __tablename__ = "price_alert_states"
+    __table_args__ = (
+        UniqueConstraint("wallet_id", "token_address", "window_minutes", "direction"),
+        Index("ix_price_alert_states_wallet_token", "wallet_id", "token_address"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    window_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)
+    last_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_alert_change_pct: Mapped[Optional[float]] = mapped_column(Numeric(12, 4), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class TokenWatchState(Base):
+    __tablename__ = "token_watch_states"
+    __table_args__ = (
+        Index("ix_token_watch_states_wallet_token_active", "wallet_id", "token_address", "active"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), nullable=False)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

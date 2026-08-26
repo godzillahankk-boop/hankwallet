@@ -11,7 +11,9 @@ from app.core.config import load_settings
 from app.core.scheduler import build_scheduler
 from app.db.database import init_db, make_engine, make_session_factory
 from app.services.chain_client import build_chain_client
+from app.services.gmgn_client import GmgnClient
 from app.services.monitoring_service import MonitoringService
+from app.services.price_guardian_service import PriceGuardianService
 from app.utils.logger import setup_logging
 
 api_app = FastAPI(title="Wallet Agent", version="0.1.0")
@@ -55,9 +57,32 @@ async def run() -> None:
         settings=settings,
         notifier=notify,
     )
-    telegram_app = build_application(settings, session_factory, monitoring_service)
+    gmgn_client = None
+    price_guardian_service = None
+    if settings.gmgn_enabled and settings.price_guardian_enabled:
+        try:
+            gmgn_client = GmgnClient.from_settings(settings)
+            price_guardian_service = PriceGuardianService(
+                session_factory=session_factory,
+                gmgn_client=gmgn_client,
+                settings=settings,
+                notifier=notify,
+            )
+        except Exception as exc:
+            logger.exception("GMGN error Price Guardian disabled during startup: %s", exc)
+    telegram_app = build_application(
+        settings,
+        session_factory,
+        monitoring_service,
+        price_guardian_service,
+    )
     telegram_app_holder["app"] = telegram_app
-    scheduler = build_scheduler(settings, session_factory, monitoring_service)
+    scheduler = build_scheduler(
+        settings,
+        session_factory,
+        monitoring_service,
+        price_guardian_service,
+    )
 
     await telegram_app.initialize()
     await telegram_app.start()
@@ -84,6 +109,8 @@ async def run() -> None:
             await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
+        if gmgn_client:
+            await gmgn_client.aclose()
         await chain_client.aclose()
 
 

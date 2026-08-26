@@ -1,0 +1,644 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+from decimal import Decimal
+
+from sqlalchemy import delete, select
+from sqlalchemy.orm import sessionmaker
+
+from app.core.config import Settings
+from app.db.database import session_scope
+from app.db.models import PriceAlertState, PriceSnapshot, TokenWatchState, Wallet
+from app.services.gmgn_client import GmgnClient, GmgnHolding
+from app.services.holding_classifier import is_trading_position
+from app.utils.time import utc_now
+
+logger = logging.getLogger(__name__)
+
+Notifier = Callable[[int, str], Awaitable[None]]
+
+WINDOWS = (5, 15, 60)
+UP = "UP"
+DOWN = "DOWN"
+
+
+@dataclass(frozen=True)
+class MonitorCandidate:
+    holding: GmgnHolding
+    monitored: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class PriceMovement:
+    window_minutes: int
+    change_pct: Decimal
+    direction: str
+
+
+@dataclass(frozen=True)
+class PriceAlert:
+    wallet_id: int
+    chat_id: int
+    token_address: str
+    symbol: str
+    price_usd: Decimal
+    balance: Decimal
+    usd_value: Decimal | None
+    movements: list[PriceMovement]
+    watch_state_id: int
+
+
+@dataclass
+class PriceGuardianResult:
+    wallets_scanned: int = 0
+    holdings_found: int = 0
+    monitored_tokens: int = 0
+    snapshots_saved: int = 0
+    alerts_sent: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+class PriceGuardianService:
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        gmgn_client: GmgnClient,
+        settings: Settings,
+        notifier: Notifier | None = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.gmgn_client = gmgn_client
+        self.settings = settings
+        self.notifier = notifier
+        self._scan_lock = asyncio.Lock()
+        self._wallet_semaphore = asyncio.Semaphore(max(settings.price_wallet_concurrency, 1))
+
+    async def scan_active_wallets(self) -> PriceGuardianResult:
+        if self._scan_lock.locked():
+            logger.info("Price Guardian scan skipped because previous run is active")
+            return PriceGuardianResult()
+        async with self._scan_lock:
+            return await self._scan_active_wallets_locked()
+
+    async def _scan_active_wallets_locked(self) -> PriceGuardianResult:
+        result = PriceGuardianResult()
+        logger.info("Price Guardian scan started")
+        with session_scope(self.session_factory) as session:
+            wallet_ids = list(
+                session.scalars(select(Wallet.id).where(Wallet.is_active.is_(True)))
+            )
+        tasks = [self._scan_wallet_guarded(wallet_id) for wallet_id in wallet_ids]
+        for wallet_result in await asyncio.gather(*tasks):
+            result.wallets_scanned += wallet_result.wallets_scanned
+            result.holdings_found += wallet_result.holdings_found
+            result.monitored_tokens += wallet_result.monitored_tokens
+            result.snapshots_saved += wallet_result.snapshots_saved
+            result.alerts_sent += wallet_result.alerts_sent
+            result.errors.extend(wallet_result.errors)
+        await self.cleanup_old_snapshots()
+        logger.info(
+            "Price Guardian scan finished wallets=%s holdings=%s monitored=%s snapshots=%s alerts=%s errors=%s",
+            result.wallets_scanned,
+            result.holdings_found,
+            result.monitored_tokens,
+            result.snapshots_saved,
+            result.alerts_sent,
+            len(result.errors),
+        )
+        return result
+
+    async def _scan_wallet_guarded(self, wallet_id: int) -> PriceGuardianResult:
+        async with self._wallet_semaphore:
+            try:
+                return await self.scan_wallet(wallet_id)
+            except Exception as exc:
+                logger.exception("Price Guardian wallet failed wallet_id=%s: %s", wallet_id, exc)
+                return PriceGuardianResult(errors=[str(exc)])
+
+    async def scan_wallet(self, wallet_id: int, *, send_alerts: bool = True) -> PriceGuardianResult:
+        result = PriceGuardianResult(wallets_scanned=1)
+        with session_scope(self.session_factory) as session:
+            wallet = session.scalar(
+                select(Wallet).where(Wallet.id == wallet_id, Wallet.is_active.is_(True))
+            )
+            if not wallet:
+                return result
+            chain = wallet.chain
+            address = wallet.address
+            chat_id = wallet.user.telegram_chat_id
+
+        try:
+            holdings = await self.fetch_all_holdings(chain, address)
+        except Exception as exc:
+            logger.warning("GMGN error wallet_id=%s: %s", wallet_id, exc)
+            result.errors.append(str(exc))
+            return result
+
+        result.holdings_found = len(holdings)
+        now = utc_now()
+        alerts: list[PriceAlert] = []
+        with session_scope(self.session_factory) as session:
+            wallet = session.scalar(
+                select(Wallet).where(Wallet.id == wallet_id, Wallet.is_active.is_(True))
+            )
+            if not wallet:
+                return result
+            held_contracts = self._held_contracts(holdings)
+            self._sync_watch_states(session, wallet, holdings, held_contracts, now)
+            for candidate in self.classify_holdings(holdings):
+                if not candidate.monitored:
+                    continue
+                holding = candidate.holding
+                if not holding.contract_address or holding.balance is None or holding.current_price_usd is None:
+                    continue
+                watch_state = self._active_watch_state(session, wallet.id, holding.contract_address)
+                if not watch_state:
+                    continue
+                snapshot = PriceSnapshot(
+                    wallet_id=wallet.id,
+                    chain=wallet.chain,
+                    token_address=holding.contract_address,
+                    symbol=holding.symbol,
+                    price_usd=holding.current_price_usd,
+                    balance=holding.balance,
+                    usd_value=holding.usd_value,
+                    observed_at=now,
+                )
+                session.add(snapshot)
+                result.monitored_tokens += 1
+                result.snapshots_saved += 1
+                token_alert = self._evaluate_alerts(session, wallet, holding, watch_state, now)
+                if token_alert:
+                    alerts.append(token_alert)
+            logger.info(
+                "Price Guardian wallet scanned wallet_id=%s holdings=%s monitored=%s snapshots=%s",
+                wallet_id,
+                result.holdings_found,
+                result.monitored_tokens,
+                result.snapshots_saved,
+            )
+
+        if send_alerts:
+            for alert in alerts:
+                try:
+                    await self._send_alert(alert)
+                except Exception as exc:
+                    logger.exception("Telegram delivery failed wallet_id=%s: %s", alert.wallet_id, exc)
+                    result.errors.append(str(exc))
+                    continue
+                self._mark_alert_delivered(alert)
+                result.alerts_sent += 1
+        return result
+
+    async def fetch_all_holdings(self, chain: str, wallet_address: str) -> list[GmgnHolding]:
+        holdings: list[GmgnHolding] = []
+        cursor: str | None = None
+        for page_index in range(self.settings.price_holdings_max_pages):
+            page = await self.gmgn_client.get_wallet_holdings_pages(
+                {
+                    "chain": chain,
+                    "wallet_address": wallet_address,
+                    "limit": 50,
+                    "order_by": "usd_value",
+                    "direction": "desc",
+                    "hide_airdrop": "true",
+                    "hide_closed": "false",
+                    **({"cursor": cursor} if cursor else {}),
+                },
+                max_pages=1,
+            )
+            if not page:
+                break
+            holdings.extend(
+                self._parse_holding(chain, item) for current_page in page for item in current_page.items
+            )
+            cursor = page[-1].next_cursor
+            if not cursor:
+                break
+            if page_index == self.settings.price_holdings_max_pages - 1:
+                logger.warning(
+                    "Price Guardian holdings pagination reached max_pages=%s wallet=%s",
+                    self.settings.price_holdings_max_pages,
+                    wallet_address,
+                )
+        return holdings
+
+    def classify_holdings(self, holdings: list[GmgnHolding]) -> list[MonitorCandidate]:
+        return [self.classify_holding(holding) for holding in holdings]
+
+    def classify_holding(self, holding: GmgnHolding) -> MonitorCandidate:
+        symbol = (holding.symbol or "").upper()
+        if symbol in self.settings.price_excluded_symbols:
+            return MonitorCandidate(holding, False, "SKIPPED_EXCLUDED_SYMBOL")
+        if not holding.contract_address:
+            return MonitorCandidate(holding, False, "SKIPPED_NO_CONTRACT")
+        if holding.balance is None or holding.balance <= 0:
+            return MonitorCandidate(holding, False, "SKIPPED_NO_BALANCE")
+        if not is_trading_position(holding):
+            return MonitorCandidate(holding, False, "SKIPPED_NO_BUY_HISTORY")
+        if holding.usd_value is None or holding.usd_value < self.settings.price_monitor_min_usd_value:
+            return MonitorCandidate(holding, False, "SKIPPED_BELOW_MIN_VALUE")
+        if holding.current_price_usd is None:
+            return MonitorCandidate(holding, False, "SKIPPED_NO_PRICE")
+        if holding.current_price_usd <= 0:
+            return MonitorCandidate(holding, False, "SKIPPED_NON_POSITIVE_PRICE")
+        return MonitorCandidate(holding, True, "MONITORED")
+
+    def _held_contracts(self, holdings: list[GmgnHolding]) -> set[str]:
+        held: set[str] = set()
+        for holding in holdings:
+            if holding.contract_address and holding.balance is not None and holding.balance > 0:
+                held.add(holding.contract_address)
+        return held
+
+    def _sync_watch_states(
+        self,
+        session,
+        wallet: Wallet,
+        holdings: list[GmgnHolding],
+        held_contracts: set[str],
+        observed_at,
+    ) -> None:
+        holdings_by_contract = {
+            holding.contract_address: holding
+            for holding in holdings
+            if holding.contract_address and holding.balance is not None and holding.balance > 0
+        }
+        active_states = list(
+            session.scalars(
+                select(TokenWatchState).where(
+                    TokenWatchState.wallet_id == wallet.id,
+                    TokenWatchState.active.is_(True),
+                )
+            )
+        )
+        for state in active_states:
+            if state.token_address not in held_contracts:
+                state.active = False
+                state.ended_at = observed_at
+        for contract, holding in holdings_by_contract.items():
+            state = self._active_watch_state(session, wallet.id, contract)
+            if state:
+                state.symbol = holding.symbol
+                state.last_seen_at = observed_at
+                continue
+            state = TokenWatchState(
+                wallet_id=wallet.id,
+                chain=wallet.chain,
+                token_address=contract,
+                symbol=holding.symbol,
+                active=True,
+                started_at=observed_at,
+                last_seen_at=observed_at,
+            )
+            session.add(state)
+            session.flush()
+            self._reset_alert_states_for_token(session, wallet.id, contract, observed_at)
+
+    def _active_watch_state(
+        self, session, wallet_id: int, token_address: str
+    ) -> TokenWatchState | None:
+        return session.scalar(
+            select(TokenWatchState).where(
+                TokenWatchState.wallet_id == wallet_id,
+                TokenWatchState.token_address == token_address,
+                TokenWatchState.active.is_(True),
+            )
+        )
+
+    def _evaluate_alerts(
+        self,
+        session,
+        wallet: Wallet,
+        holding: GmgnHolding,
+        watch_state: TokenWatchState,
+        observed_at,
+    ) -> PriceAlert | None:
+        if not holding.contract_address or holding.current_price_usd is None or holding.balance is None:
+            return None
+        movements: list[PriceMovement] = []
+        thresholds = self._thresholds()
+        for window_minutes, threshold in thresholds.items():
+            baseline = self._baseline_snapshot(
+                session,
+                wallet.id,
+                holding.contract_address,
+                watch_state.started_at,
+                observed_at,
+                window_minutes,
+            )
+            if not baseline or baseline.price_usd is None or baseline.price_usd <= 0:
+                continue
+            change_pct = ((holding.current_price_usd - baseline.price_usd) / baseline.price_usd) * Decimal("100")
+            direction = UP if change_pct > 0 else DOWN
+            self._reset_opposite_if_needed(
+                session,
+                wallet.id,
+                holding.contract_address,
+                window_minutes,
+                direction,
+                observed_at,
+            )
+            if self._should_alert(
+                session,
+                wallet.id,
+                holding.contract_address,
+                window_minutes,
+                direction,
+                change_pct,
+                threshold,
+            ):
+                movements.append(
+                    PriceMovement(
+                        window_minutes=window_minutes,
+                        change_pct=change_pct,
+                        direction=direction,
+                    )
+                )
+            self._reset_if_recovered(
+                session,
+                wallet.id,
+                holding.contract_address,
+                window_minutes,
+                change_pct,
+                threshold,
+                observed_at,
+            )
+        if not movements:
+            return None
+        return PriceAlert(
+            wallet_id=wallet.id,
+            chat_id=wallet.user.telegram_chat_id,
+            token_address=holding.contract_address,
+            symbol=holding.symbol or holding.contract_address,
+            price_usd=holding.current_price_usd,
+            balance=holding.balance,
+            usd_value=holding.usd_value,
+            movements=movements,
+            watch_state_id=watch_state.id,
+        )
+
+    def _baseline_snapshot(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_started_at,
+        observed_at,
+        window_minutes: int,
+    ) -> PriceSnapshot | None:
+        target = observed_at - timedelta(minutes=window_minutes)
+        tolerance = timedelta(seconds=self._baseline_tolerance_seconds(window_minutes))
+        lower_bound = max(target - tolerance, watch_started_at)
+        upper_bound = target + tolerance
+        candidates = list(
+            session.scalars(
+                select(PriceSnapshot)
+                .where(
+                    PriceSnapshot.wallet_id == wallet_id,
+                    PriceSnapshot.token_address == token_address,
+                    PriceSnapshot.observed_at >= lower_bound,
+                    PriceSnapshot.observed_at <= upper_bound,
+                )
+            )
+        )
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda snapshot: abs((snapshot.observed_at - target).total_seconds()),
+        )
+
+    def _should_alert(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        window_minutes: int,
+        direction: str,
+        change_pct: Decimal,
+        threshold: Decimal,
+    ) -> bool:
+        if abs(change_pct) < threshold:
+            return False
+        state = self._find_state(session, wallet_id, token_address, window_minutes, direction)
+        if state is None or not state.active or state.last_alert_change_pct is None:
+            logger.info(
+                "Price alert triggered symbol_token=%s window=%s change_pct=%s",
+                token_address,
+                window_minutes,
+                change_pct,
+            )
+            return True
+        previous = abs(Decimal(str(state.last_alert_change_pct)))
+        if abs(change_pct) - previous >= self.settings.price_alert_escalation_step_percent:
+            logger.info(
+                "Price alert escalation token=%s window=%s change_pct=%s",
+                token_address,
+                window_minutes,
+                change_pct,
+            )
+            return True
+        return False
+
+    def _reset_if_recovered(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        window_minutes: int,
+        change_pct: Decimal,
+        threshold: Decimal,
+        observed_at,
+    ) -> None:
+        if abs(change_pct) >= threshold * self.settings.price_alert_reset_ratio:
+            return
+        for direction in (UP, DOWN):
+            state = self._find_state(session, wallet_id, token_address, window_minutes, direction)
+            if state and state.active:
+                state.active = False
+                state.updated_at = observed_at
+
+    def _reset_opposite_if_needed(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        window_minutes: int,
+        direction: str,
+        observed_at,
+    ) -> None:
+        opposite = DOWN if direction == UP else UP
+        state = self._find_state(session, wallet_id, token_address, window_minutes, opposite)
+        if state and state.active:
+            state.active = False
+            state.updated_at = observed_at
+
+    def _get_or_create_state(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        window_minutes: int,
+        direction: str,
+    ) -> PriceAlertState:
+        state = self._find_state(session, wallet_id, token_address, window_minutes, direction)
+        if state:
+            return state
+        state = PriceAlertState(
+            wallet_id=wallet_id,
+            token_address=token_address,
+            window_minutes=window_minutes,
+            direction=direction,
+            active=False,
+        )
+        session.add(state)
+        session.flush()
+        return state
+
+    def _reset_alert_states_for_token(
+        self, session, wallet_id: int, token_address: str, observed_at
+    ) -> None:
+        states = list(
+            session.scalars(
+                select(PriceAlertState).where(
+                    PriceAlertState.wallet_id == wallet_id,
+                    PriceAlertState.token_address == token_address,
+                )
+            )
+        )
+        for state in states:
+            state.active = False
+            state.last_alert_at = None
+            state.last_alert_change_pct = None
+            state.updated_at = observed_at
+
+    def _find_state(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        window_minutes: int,
+        direction: str,
+    ) -> PriceAlertState | None:
+        return session.scalar(
+            select(PriceAlertState).where(
+                PriceAlertState.wallet_id == wallet_id,
+                PriceAlertState.token_address == token_address,
+                PriceAlertState.window_minutes == window_minutes,
+                PriceAlertState.direction == direction,
+            )
+        )
+
+    @staticmethod
+    def _mark_alerted(state: PriceAlertState, change_pct: Decimal, observed_at) -> None:
+        state.active = True
+        state.last_alert_at = observed_at
+        state.last_alert_change_pct = change_pct
+        state.updated_at = observed_at
+
+    async def _send_alert(self, alert: PriceAlert) -> None:
+        if not self.notifier:
+            raise RuntimeError("telegram_notifier_not_configured")
+        await self.notifier(alert.chat_id, format_price_alert(alert))
+        logger.info("Telegram delivery success wallet_id=%s token=%s", alert.wallet_id, alert.token_address)
+
+    def _mark_alert_delivered(self, alert: PriceAlert) -> None:
+        delivered_at = utc_now()
+        with session_scope(self.session_factory) as session:
+            for movement in alert.movements:
+                state = self._get_or_create_state(
+                    session,
+                    alert.wallet_id,
+                    alert.token_address,
+                    movement.window_minutes,
+                    movement.direction,
+                )
+                self._mark_alerted(state, movement.change_pct, delivered_at)
+
+    async def cleanup_old_snapshots(self) -> int:
+        cutoff = utc_now() - timedelta(hours=self.settings.price_history_retention_hours)
+        with session_scope(self.session_factory) as session:
+            result = session.execute(delete(PriceSnapshot).where(PriceSnapshot.observed_at < cutoff))
+            return int(result.rowcount or 0)
+
+    def _thresholds(self) -> dict[int, Decimal]:
+        return {
+            5: self.settings.price_alert_5m_percent,
+            15: self.settings.price_alert_15m_percent,
+            60: self.settings.price_alert_60m_percent,
+        }
+
+    @staticmethod
+    def _baseline_tolerance_seconds(window_minutes: int) -> int:
+        return {5: 75, 15: 90, 60: 120}.get(window_minutes, 90)
+
+    @staticmethod
+    def _parse_holding(chain: str, item: dict) -> GmgnHolding:
+        from app.services.gmgn_client import parse_holding
+
+        return parse_holding(chain, item)
+
+
+def format_price_alert(alert: PriceAlert) -> str:
+    primary = max(alert.movements, key=lambda movement: abs(movement.change_pct))
+    emoji = "🚀" if primary.direction == UP else "🔴"
+    direction_text = "快速上涨" if primary.direction == UP else "快速下跌"
+    lines = [f"{emoji} {alert.symbol} {direction_text}", ""]
+    for movement in sorted(alert.movements, key=lambda item: item.window_minutes):
+        lines.append(f"{_window_label(movement.window_minutes)}：{_format_pct(movement.change_pct)}")
+    lines.extend(
+        [
+            "",
+            f"当前价格：${format_price(alert.price_usd)}",
+            f"当前持仓：{format_balance(alert.balance)} {alert.symbol}",
+        ]
+    )
+    if alert.usd_value is not None:
+        lines.append(f"当前价值：${format_usd(alert.usd_value)}")
+    return "\n".join(lines)
+
+
+def format_price(value: Decimal) -> str:
+    if value >= Decimal("1"):
+        return f"{value.quantize(Decimal('0.01')):f}"
+    text = f"{value.normalize():f}"
+    if "." not in text:
+        return text
+    decimals = text.split(".", 1)[1]
+    leading_zeroes = len(decimals) - len(decimals.lstrip("0"))
+    places = min(max(leading_zeroes + 4, 6), 12)
+    return f"{value:.{places}f}".rstrip("0").rstrip(".")
+
+
+def format_balance(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    abs_value = abs(value)
+    if abs_value >= Decimal("1000000"):
+        return f"{value.quantize(Decimal('1')):,}"
+    if abs_value >= Decimal("1000"):
+        return f"{value.quantize(Decimal('0.01')):,}".rstrip("0").rstrip(".")
+    if abs_value >= Decimal("1"):
+        return f"{value.quantize(Decimal('0.0001')):,}".rstrip("0").rstrip(".")
+    return f"{value.normalize():f}".rstrip("0").rstrip(".")
+
+
+def format_usd(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01')):,.2f}"
+
+
+def _format_pct(value: Decimal) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value.quantize(Decimal('0.1'))}%"
+
+
+def _window_label(window_minutes: int) -> str:
+    if window_minutes == 60:
+        return "1小时"
+    return f"{window_minutes}分钟"

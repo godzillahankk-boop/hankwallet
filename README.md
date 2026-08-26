@@ -4,7 +4,7 @@ Wallet Agent 是一个面向链上交易用户的 AI 持仓监控与风险情报
 
 ## 当前版本
 
-V0.1.0 - Wallet Position Tracker
+V0.3.0 - Price Movement Guardian
 
 已实现：
 
@@ -20,6 +20,12 @@ V0.1.0 - Wallet Position Tracker
 - `position_transactions` 重复交易保护
 - SQLite 持久化
 - 基础测试
+- GMGN Read Only 数据源验证
+- 使用 GMGN Holdings 自动识别 Robinhood 当前持仓
+- Price Guardian 独立定时任务
+- 自动记录持仓 Token 价格快照
+- 5m / 15m / 60m 快速上涨、下跌 Telegram 主动提醒
+- Alert 去重、升级提醒、回落重置
 
 ## 环境要求
 
@@ -47,6 +53,7 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token
 DATABASE_URL=sqlite:///./data/wallet_agent.db
 WALLET_SCAN_INTERVAL_SECONDS=60
+LEGACY_WALLET_SCAN_ENABLED=false
 DEFAULT_CHAIN=robinhood
 CHAIN_API_BASE_URL=https://api.blockscout.com/4663
 CHAIN_API_KEY=你的 Blockscout Pro API Key
@@ -58,6 +65,14 @@ GMGN_ENABLED=false
 GMGN_API_BASE_URL=https://openapi.gmgn.ai
 GMGN_API_KEY=
 GMGN_PRIVATE_KEY_PATH=
+
+PRICE_GUARDIAN_ENABLED=true
+PRICE_SCAN_INTERVAL_SECONDS=60
+PRICE_MONITOR_MIN_USD_VALUE=5
+PRICE_EXCLUDED_SYMBOLS=USDG,USDC,USDT,ETH,WETH
+PRICE_ALERT_5M_PERCENT=10
+PRICE_ALERT_15M_PERCENT=20
+PRICE_ALERT_60M_PERCENT=30
 ```
 
 Robinhood Chain 主网使用：
@@ -103,6 +118,43 @@ python scripts/gmgn_probe.py 0x...
 
 脚本只读取 GMGN 和 Robinhood RPC/Blockscout 数据，不修改数据库。
 
+## Price Guardian
+
+Price Guardian 使用 GMGN `wallet_holdings` 中的 `token.price` 作为价格源。正常价格扫描路径不调用 Blockscout，也不做全量 RPC `balanceOf`。
+
+默认每 60 秒扫描一次活跃钱包：
+
+```env
+PRICE_GUARDIAN_ENABLED=true
+PRICE_SCAN_INTERVAL_SECONDS=60
+PRICE_MONITOR_MIN_USD_VALUE=5
+PRICE_EXCLUDED_SYMBOLS=USDG,USDC,USDT,ETH,WETH
+PRICE_HISTORY_RETENTION_HOURS=24
+PRICE_ALERT_5M_PERCENT=10
+PRICE_ALERT_15M_PERCENT=20
+PRICE_ALERT_60M_PERCENT=30
+PRICE_ALERT_ESCALATION_STEP_PERCENT=10
+PRICE_ALERT_RESET_RATIO=0.5
+PRICE_HOLDINGS_MAX_PAGES=10
+PRICE_WALLET_CONCURRENCY=3
+```
+
+诊断当前钱包哪些 Token 会进入价格监控：
+
+```bash
+python scripts/price_guardian_probe.py 0x... --once
+```
+
+输出会标记 `MONITORED`、`SKIPPED_EXCLUDED_SYMBOL`、`SKIPPED_BELOW_MIN_VALUE`、`SKIPPED_NO_PRICE` 等状态。该脚本不发送 Telegram 消息，也不写入正式数据库。
+
+发送一条真实 Telegram 通知链路测试消息：
+
+```bash
+python scripts/price_guardian_probe.py 0x... --test-alert
+```
+
+这条消息会明确标识为 `🧪 Price Guardian 测试提醒`，不会写入 `PriceAlertState`，也不会伪造成真实行情异动。
+
 ## 启动
 
 ```bash
@@ -113,7 +165,15 @@ python run.py
 
 - FastAPI health endpoint: `http://127.0.0.1:8000/health`
 - Telegram Bot polling
-- APScheduler 定时钱包扫描
+- APScheduler Price Guardian 价格异动扫描
+
+旧的 Blockscout/RPC 钱包自动扫描默认不注册后台 Scheduler job：
+
+```env
+LEGACY_WALLET_SCAN_ENABLED=false
+```
+
+Telegram 的“立即扫描”等旧功能仍保留。需要恢复旧后台自动扫描时，把该配置改为 `true`。
 
 日志写入：
 
@@ -162,7 +222,8 @@ pytest
 ## 当前限制
 
 - 暂无真实 PnL
-- 暂无价格
+- 当前价格仅使用 GMGN Holdings 的 `token.price`
+- 暂无完整 Cost Basis / Avg Cost / PnL Guardian
 - 暂无流动性判断
 - 暂无 Dev Wallet / Dev X / Official X
 - 暂无 KOL 和社交热度

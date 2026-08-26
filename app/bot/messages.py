@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from app.bot.formatters import (
+    decimal_or_none,
+    format_holding_pnl_pct,
+    format_holding_quantity,
+    format_holding_usd,
+)
 from app.db.models import Position, Wallet, WalletTokenBalance
+from app.services.gmgn_client import GmgnHolding
+from app.services.holding_classifier import is_trading_position
 from app.utils.address import short_address
 
 
@@ -62,12 +70,48 @@ def balances_message(balances: list[WalletTokenBalance]) -> str:
     lines = ["💼 当前持仓", ""]
     for balance in balances:
         symbol = balance.symbol or short_address(balance.contract_address or balance.asset_key)
+        amount = decimal_or_none(balance.token_amount)
+        usd_value = decimal_or_none(balance.usd_value)
+        unrealized_profit = decimal_or_none(getattr(balance, "unrealized_profit", None))
         lines.append(f"🟢 {symbol}")
-        lines.append(format_amount(Decimal(str(balance.token_amount or '0'))))
-        if balance.usd_value:
-            lines.append(f"${format_amount(Decimal(str(balance.usd_value)))}")
+        lines.append(f"数量：{format_holding_quantity(amount)}")
+        lines.append(f"金额：{format_holding_usd(usd_value)}")
+        lines.append(f"持仓盈亏：{format_holding_pnl_pct(usd_value, unrealized_profit)}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def gmgn_holdings_message(holdings: list[GmgnHolding], min_usd_value: Decimal) -> str:
+    trading_holdings = [holding for holding in holdings if is_trading_position(holding)]
+    if not trading_holdings:
+        return NO_POSITIONS_MESSAGE
+    display_holdings = [
+        holding
+        for holding in trading_holdings
+        if holding.usd_value is not None and holding.usd_value >= min_usd_value
+    ]
+    lines = ["💼 当前持仓", f"（已隐藏金额<{format_threshold_usd(min_usd_value)}代币）", ""]
+    if not display_holdings:
+        lines.append("当前没有达到关注金额的持仓。")
+        return "\n".join(lines).strip()
+    for holding in display_holdings:
+        symbol = holding.symbol or short_address(holding.contract_address or "")
+        lines.append(f"🟢 {symbol}")
+        lines.append(f"数量：{format_holding_quantity(holding.balance)}")
+        lines.append(f"金额：{format_holding_usd(holding.usd_value)}")
+        lines.append(
+            f"持仓盈亏：{format_holding_pnl_pct(holding.usd_value, holding.unrealized_profit_usd)}"
+        )
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def format_threshold_usd(value: Decimal) -> str:
+    rounded = value.quantize(Decimal("0.1"))
+    text = f"{rounded:,.1f}"
+    if text.endswith(".0"):
+        text = text[:-2]
+    return f"${text}"
 
 
 def scan_done_message(created: int, updated: int, closed: int) -> str:

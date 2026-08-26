@@ -56,6 +56,7 @@ def settings(tmp_path) -> Settings:
         telegram_bot_token="test-token",
         database_url=f"sqlite:///{tmp_path}/wallet_agent_test.db",
         wallet_scan_interval_seconds=60,
+        legacy_wallet_scan_enabled=False,
         manual_scan_cooldown_seconds=30,
         dust_threshold=Decimal("0.000001"),
         dust_clear_confirmation_scans=2,
@@ -74,6 +75,18 @@ def settings(tmp_path) -> Settings:
         gmgn_api_key=None,
         gmgn_private_key_path=None,
         gmgn_request_timeout_seconds=20,
+        price_guardian_enabled=True,
+        price_scan_interval_seconds=60,
+        price_monitor_min_usd_value=Decimal("5"),
+        price_excluded_symbols=("USDG", "USDC", "USDT", "ETH", "WETH"),
+        price_history_retention_hours=24,
+        price_alert_5m_percent=Decimal("10"),
+        price_alert_15m_percent=Decimal("20"),
+        price_alert_60m_percent=Decimal("30"),
+        price_alert_escalation_step_percent=Decimal("10"),
+        price_alert_reset_ratio=Decimal("0.5"),
+        price_holdings_max_pages=10,
+        price_wallet_concurrency=3,
     )
 
 

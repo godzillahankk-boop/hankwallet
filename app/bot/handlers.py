@@ -33,6 +33,7 @@ from app.bot.messages import (
     START_MESSAGE,
     balances_message,
     duplicate_wallet_message,
+    gmgn_holdings_message,
     invalid_wallet_message,
     scan_done_message,
     wallet_added_message,
@@ -42,7 +43,9 @@ from app.core.config import Settings
 from app.db.database import session_scope
 from app.db.models import User, Wallet
 from app.services.balance_service import BalanceService
+from app.services.gmgn_client import GmgnHolding
 from app.services.monitoring_service import MonitoringService
+from app.services.price_guardian_service import PriceGuardianService
 from app.services.wallet_service import WalletService
 
 logger = logging.getLogger(__name__)
@@ -55,10 +58,12 @@ def build_application(
     settings: Settings,
     session_factory: sessionmaker,
     monitoring_service: MonitoringService,
+    price_guardian_service: PriceGuardianService | None = None,
 ) -> Application:
     application = Application.builder().token(settings.telegram_bot_token).build()
     application.bot_data["session_factory"] = session_factory
     application.bot_data["monitoring_service"] = monitoring_service
+    application.bot_data["price_guardian_service"] = price_guardian_service
     application.bot_data["settings"] = settings
     application.bot_data["manual_scan_at"] = {}
 
@@ -195,7 +200,11 @@ async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     monitoring_service: MonitoringService = context.application.bot_data[
         "monitoring_service"
     ]
+    price_guardian_service: PriceGuardianService | None = context.application.bot_data.get(
+        "price_guardian_service"
+    )
     wallet_ids: list[int] = []
+    wallet_refs: list[tuple[int, str, str]] = []
     balances = []
     stale_wallet_ids: list[int] = []
     with session_scope(session_factory) as session:
@@ -210,6 +219,27 @@ async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     )
                 )
             )
+            wallet_refs = list(
+                session.execute(
+                    select(Wallet.id, Wallet.chain, Wallet.address).where(
+                        Wallet.user_id == user.id, Wallet.is_active.is_(True)
+                    )
+                )
+            )
+    if price_guardian_service and wallet_refs:
+        try:
+            holdings = await fetch_gmgn_position_holdings(wallet_refs, price_guardian_service)
+            text = gmgn_holdings_message(holdings, settings.price_monitor_min_usd_value)
+            await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+            return
+        except Exception as exc:
+            logger.exception("GMGN holdings refresh failed for positions view: %s", exc)
+            await update.message.reply_text(
+                "\n".join(["⚠️ GMGN 持仓刷新失败", "", str(exc)]),
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+    with session_scope(session_factory) as session:
         balance_service = BalanceService(session)
         balances = balance_service.list_user_balances(update.effective_user.id)
         stale_wallet_ids = [
@@ -242,6 +272,16 @@ async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         balances = BalanceService(session).list_user_balances(update.effective_user.id)
         text = balances_message(balances)
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+
+
+async def fetch_gmgn_position_holdings(
+    wallet_refs: list[tuple[int, str, str]],
+    price_guardian_service: PriceGuardianService,
+) -> list[GmgnHolding]:
+    holdings: list[GmgnHolding] = []
+    for _, chain, address in wallet_refs:
+        holdings.extend(await price_guardian_service.fetch_all_holdings(chain, address))
+    return holdings
 
 
 async def _refresh_wallet_balances_safely(
