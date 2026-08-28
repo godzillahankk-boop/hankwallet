@@ -49,6 +49,31 @@ class GmgnApiError(GmgnClientError):
         self.api_error = api_error
 
 
+class GmgnRateLimitError(GmgnApiError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 429,
+        api_code: int | None = None,
+        api_error: str | None = None,
+        retry_after_seconds: float | None = None,
+        limit: str | None = None,
+        remaining: str | None = None,
+        reset: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            status_code=status_code,
+            api_code=api_code,
+            api_error=api_error,
+        )
+        self.retry_after_seconds = retry_after_seconds
+        self.limit = limit
+        self.remaining = remaining
+        self.reset = reset
+
+
 @dataclass(frozen=True)
 class GmgnHolding:
     chain: str
@@ -114,6 +139,115 @@ class GmgnPage:
     raw: Any = field(repr=False)
 
 
+@dataclass(frozen=True)
+class GmgnTokenOverview:
+    chain: str
+    token_address: str | None
+    symbol: str | None
+    name: str | None
+    price_usd: Decimal | None
+    market_cap_usd: Decimal | None
+    fdv_usd: Decimal | None
+    liquidity_usd: Decimal | None
+    holder_count: int | None
+    top10_holder_rate: Decimal | None
+    smart_money_count: int | None
+    kol_count: int | None
+    creator_address: str | None
+    created_at: int | None
+    twitter: str | None
+    telegram: str | None
+    website: str | None
+    raw: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class GmgnTokenSecurity:
+    chain: str
+    token_address: str | None
+    is_honeypot: Any
+    is_open_source: Any
+    owner: str | None
+    ownership_renounced: Any
+    buy_tax: Decimal | None
+    sell_tax: Decimal | None
+    top10_holder_rate: Decimal | None
+    rug_ratio: Decimal | None
+    risk_flags: dict[str, Any]
+    raw: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class GmgnLiquidity:
+    chain: str
+    token_address: str | None
+    pool_address: str | None
+    dex: str | None
+    liquidity_usd: Decimal | None
+    base_reserve: Decimal | None
+    quote_reserve: Decimal | None
+    quote_address: str | None
+    quote_symbol: str | None
+    price_usd: Decimal | None
+    volume_24h_usd: Decimal | None
+    buy_volume_24h_usd: Decimal | None
+    sell_volume_24h_usd: Decimal | None
+    raw: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class GmgnHolder:
+    chain: str
+    wallet_address: str | None
+    balance: Decimal | None
+    hold_percentage: Decimal | None
+    usd_value: Decimal | None
+    avg_cost_usd: Decimal | None
+    realized_profit_usd: Decimal | None
+    unrealized_profit_usd: Decimal | None
+    buy_tx_count: int | None
+    sell_tx_count: int | None
+    start_holding_at: int | None
+    tags: list[str]
+    maker_token_tags: list[str]
+    twitter_name: str | None
+    twitter_username: str | None
+    raw: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class GmgnTrackTrade:
+    chain: str | None
+    wallet_address: str | None
+    token_address: str | None
+    symbol: str | None
+    side: str | None
+    token_amount: Decimal | None
+    usd_value: Decimal | None
+    price_usd: Decimal | None
+    timestamp: int | None
+    tx_hash: str | None
+    open_or_close: int | None
+    wallet_tags: list[str]
+    twitter_username: str | None
+    twitter_name: str | None
+    raw: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class GmgnMarketSignal:
+    chain: str
+    event_id: str | None
+    token_address: str | None
+    signal_type: int | None
+    trigger_at: int | None
+    trigger_market_cap_usd: Decimal | None
+    market_cap_usd: Decimal | None
+    liquidity_usd: Decimal | None
+    holder_count: int | None
+    raw: dict[str, Any] = field(repr=False)
+
+
 class GmgnClient:
     """GMGN OpenAPI portfolio client.
 
@@ -127,11 +261,19 @@ class GmgnClient:
         private_key_pem: str | None = None,
         base_url: str = "https://openapi.gmgn.ai",
         timeout_seconds: int = 20,
+        min_request_interval_seconds: float = 0.0,
+        rate_limit_max_retries: int = 3,
+        rate_limit_backoff_seconds: tuple[float, ...] = (2.0, 5.0, 10.0),
     ) -> None:
         self.api_key = api_key
         self.private_key_pem = private_key_pem
         self.base_url = base_url.rstrip("/")
         self.client = httpx.AsyncClient(timeout=timeout_seconds)
+        self.min_request_interval_seconds = min_request_interval_seconds
+        self.rate_limit_max_retries = rate_limit_max_retries
+        self.rate_limit_backoff_seconds = rate_limit_backoff_seconds
+        self._request_lock = asyncio.Lock()
+        self._last_request_at = 0.0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> GmgnClient:
@@ -260,6 +402,129 @@ class GmgnClient:
         )
         return data if isinstance(data, dict) else {"data": data}
 
+    async def get_token_overview(self, chain: str, token_address: str) -> GmgnTokenOverview:
+        data = await self.get_token_overview_raw(chain, token_address)
+        return parse_token_overview(chain, data if isinstance(data, dict) else {"data": data})
+
+    async def get_token_overview_raw(self, chain: str, token_address: str) -> Any:
+        return await self._request(
+            "GET",
+            "/v1/token/info",
+            {"chain": chain, "address": token_address},
+            signed=False,
+        )
+
+    async def get_token_security(self, chain: str, token_address: str) -> GmgnTokenSecurity:
+        data = await self.get_token_security_raw(chain, token_address)
+        return parse_token_security(chain, data if isinstance(data, dict) else {"data": data})
+
+    async def get_token_security_raw(self, chain: str, token_address: str) -> Any:
+        return await self._request(
+            "GET",
+            "/v1/token/security",
+            {"chain": chain, "address": token_address},
+            signed=False,
+        )
+
+    async def get_token_pool_info(self, chain: str, token_address: str) -> GmgnLiquidity:
+        data = await self.get_token_pool_info_raw(chain, token_address)
+        return parse_liquidity(chain, data if isinstance(data, dict) else {"data": data})
+
+    async def get_token_pool_info_raw(self, chain: str, token_address: str) -> Any:
+        return await self._request(
+            "GET",
+            "/v1/token/pool_info",
+            {"chain": chain, "address": token_address},
+            signed=False,
+        )
+
+    async def get_token_holders(
+        self,
+        chain: str,
+        token_address: str,
+        *,
+        limit: int = 20,
+        order_by: str = "amount_percentage",
+        direction: str = "desc",
+        tag: str | None = None,
+    ) -> list[GmgnHolder]:
+        data = await self.get_token_holders_raw(
+            chain,
+            token_address,
+            limit=limit,
+            order_by=order_by,
+            direction=direction,
+            tag=tag,
+        )
+        return [parse_holder(chain, item) for item in _extract_items(data)]
+
+    async def get_token_holders_raw(
+        self,
+        chain: str,
+        token_address: str,
+        *,
+        limit: int = 20,
+        order_by: str = "amount_percentage",
+        direction: str = "desc",
+        tag: str | None = None,
+    ) -> Any:
+        query: dict[str, Any] = {
+            "chain": chain,
+            "address": token_address,
+            "limit": limit,
+            "order_by": order_by,
+            "direction": direction,
+        }
+        if tag:
+            query["tag"] = tag
+        return await self._request(
+            "GET",
+            "/v1/market/token_top_holders",
+            query,
+            signed=False,
+        )
+
+    async def get_track_feed(
+        self,
+        feed_type: str,
+        *,
+        chain: str,
+        limit: int = 50,
+    ) -> list[GmgnTrackTrade]:
+        data = await self.get_track_feed_raw(feed_type, chain=chain, limit=limit)
+        return [parse_track_trade(item) for item in _extract_items(data)]
+
+    async def get_track_feed_raw(self, feed_type: str, *, chain: str, limit: int = 50) -> Any:
+        if feed_type not in {"kol", "smartmoney"}:
+            raise ValueError("feed_type must be 'kol' or 'smartmoney'")
+        return await self._request(
+            "GET",
+            f"/v1/user/{feed_type}",
+            {"chain": chain, "limit": limit},
+            signed=False,
+        )
+
+    async def get_market_signals(
+        self,
+        chain: str,
+        groups: list[dict[str, Any]] | None = None,
+    ) -> list[GmgnMarketSignal]:
+        data = await self.get_market_signals_raw(chain, groups=groups)
+        return [parse_market_signal(chain, item) for item in _extract_items(data)]
+
+    async def get_market_signals_raw(
+        self,
+        chain: str,
+        groups: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        return await self._request(
+            "POST",
+            "/v1/market/token_signal",
+            {},
+            signed=False,
+            body={"chain": chain, "groups": groups or [{}]},
+        )
+
     async def _collect_pages(
         self,
         method: str,
@@ -316,8 +581,10 @@ class GmgnClient:
         url = f"{self.base_url}{path}"
         params = _query_pairs(query_with_auth)
         last_error: Exception | None = None
-        for attempt in range(2):
+        max_attempts = max(1, self.rate_limit_max_retries + 1)
+        for attempt in range(max_attempts):
             try:
+                await self._throttle_request()
                 response = await self.client.request(
                     method,
                     url,
@@ -329,8 +596,18 @@ class GmgnClient:
             except GmgnApiError as exc:
                 if exc.status_code in {401, 403}:
                     raise GmgnAuthError(str(exc)) from exc
-                if exc.status_code == 429 and attempt == 0:
-                    await asyncio.sleep(1)
+                if isinstance(exc, GmgnRateLimitError) and attempt < max_attempts - 1:
+                    delay = self._rate_limit_delay(exc, attempt)
+                    logger.warning(
+                        "GMGN rate limited path=%s retry_after=%s limit=%s remaining=%s reset=%s attempt=%s",
+                        path,
+                        delay,
+                        exc.limit,
+                        exc.remaining,
+                        exc.reset,
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(delay)
                     last_error = exc
                     continue
                 raise
@@ -342,6 +619,29 @@ class GmgnClient:
                 raise GmgnClientError(f"GMGN request failed for {path}") from None
         raise GmgnClientError(f"GMGN request failed for {path}: {last_error}") from None
 
+    async def _throttle_request(self) -> None:
+        if self.min_request_interval_seconds <= 0:
+            return
+        async with self._request_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_at
+            wait_seconds = self.min_request_interval_seconds - elapsed
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            self._last_request_at = time.monotonic()
+
+    def _rate_limit_delay(self, exc: GmgnRateLimitError, attempt: int) -> float:
+        if exc.retry_after_seconds is not None:
+            return max(0.0, exc.retry_after_seconds)
+        if exc.reset:
+            reset_delay = _reset_delay_seconds(exc.reset)
+            if reset_delay is not None:
+                return reset_delay
+        if self.rate_limit_backoff_seconds:
+            index = min(attempt, len(self.rate_limit_backoff_seconds) - 1)
+            return self.rate_limit_backoff_seconds[index]
+        return 2.0
+
     async def _parse_response(
         self, method: str, path: str, response: httpx.Response
     ) -> Any:
@@ -352,6 +652,17 @@ class GmgnClient:
                 f"GMGN {method} {path} returned non-JSON response",
                 status_code=response.status_code,
             ) from None
+        if response.status_code == 429:
+            rate_headers = _rate_limit_headers(response)
+            raise GmgnRateLimitError(
+                f"GMGN {method} {path} rate limited with HTTP 429",
+                api_code=_int_or_none(data.get("code")) if isinstance(data, dict) else None,
+                api_error=str(data.get("error")) if isinstance(data, dict) and data.get("error") else None,
+                retry_after_seconds=_retry_after_seconds(response.headers.get("Retry-After")),
+                limit=rate_headers.get("limit"),
+                remaining=rate_headers.get("remaining"),
+                reset=rate_headers.get("reset"),
+            )
         if response.status_code >= 400:
             raise GmgnApiError(
                 f"GMGN {method} {path} failed with HTTP {response.status_code}",
@@ -455,6 +766,159 @@ def parse_stats(chain: str, wallet_address: str, item: dict[str, Any]) -> GmgnSt
     )
 
 
+def parse_token_overview(chain: str, item: dict[str, Any]) -> GmgnTokenOverview:
+    price = _dict_or_empty(item.get("price"))
+    pool = _dict_or_empty(item.get("pool"))
+    dev = _dict_or_empty(item.get("dev"))
+    link = _dict_or_empty(item.get("link"))
+    stat = _dict_or_empty(item.get("stat"))
+    tags_stat = _dict_or_empty(item.get("wallet_tags_stat"))
+    address = _first(item, {}, "address", "token_address", "contract_address")
+    price_usd = _decimal_or_none(_first(price, item, "price", "price_usd"))
+    market_cap = _decimal_or_none(_first(item, price, "market_cap", "marketcap", "mcap"))
+    if market_cap is None and price_usd is not None:
+        supply = _decimal_or_none(_first(item, {}, "circulating_supply", "total_supply"))
+        market_cap = price_usd * supply if supply is not None else None
+    return GmgnTokenOverview(
+        chain=chain,
+        token_address=_normalize_or_none(address),
+        symbol=_str_or_none(_first(item, {}, "symbol", "token_symbol")),
+        name=_str_or_none(_first(item, {}, "name", "token_name")),
+        price_usd=price_usd,
+        market_cap_usd=market_cap,
+        fdv_usd=_decimal_or_none(_first(item, price, "fdv", "fully_diluted_value", "fully_diluted_market_cap")),
+        liquidity_usd=_decimal_or_none(_first(item, pool, "liquidity", "liquidity_usd")),
+        holder_count=_int_or_none(_first(item, stat, "holder_count", "holders")),
+        top10_holder_rate=_decimal_or_none(_first(stat, dev, "top_10_holder_rate", "top10_holder_rate")),
+        smart_money_count=_int_or_none(
+            _first(tags_stat, item, "smart_degen_wallets", "smart_degen_count", "smart_money_count")
+        ),
+        kol_count=_int_or_none(_first(tags_stat, item, "renowned_wallets", "renowned_count", "kol_count")),
+        creator_address=_normalize_or_none(_first(dev, item, "creator_address", "creator")),
+        created_at=_int_or_none(_first(item, {}, "creation_timestamp", "created_at", "created_timestamp")),
+        twitter=_str_or_none(_first(link, item, "twitter_username", "twitter")),
+        telegram=_str_or_none(_first(link, item, "telegram")),
+        website=_str_or_none(_first(link, item, "website")),
+        raw=item,
+    )
+
+
+def parse_token_security(chain: str, item: dict[str, Any]) -> GmgnTokenSecurity:
+    risk_keys = (
+        "renounced_mint",
+        "renounced_freeze_account",
+        "blacklist",
+        "is_blacklisted",
+        "pause",
+        "pausable",
+        "can_mint",
+        "mintable",
+        "is_wash_trading",
+        "rat_trader_amount_rate",
+        "bundler_trader_amount_rate",
+        "sniper_count",
+        "burn_status",
+        "dev_team_hold_rate",
+        "creator_balance_rate",
+        "creator_token_status",
+        "suspected_insider_hold_rate",
+    )
+    return GmgnTokenSecurity(
+        chain=chain,
+        token_address=_normalize_or_none(_first(item, {}, "address", "token_address", "contract_address")),
+        is_honeypot=_first(item, {}, "is_honeypot", "honeypot"),
+        is_open_source=_first(item, {}, "open_source", "is_open_source"),
+        owner=_normalize_or_none(_first(item, {}, "owner", "owner_address")),
+        ownership_renounced=_first(item, {}, "owner_renounced", "ownership_renounced", "is_renounced"),
+        buy_tax=_decimal_or_none(_first(item, {}, "buy_tax")),
+        sell_tax=_decimal_or_none(_first(item, {}, "sell_tax")),
+        top10_holder_rate=_decimal_or_none(_first(item, {}, "top_10_holder_rate", "top10_holder_rate")),
+        rug_ratio=_decimal_or_none(_first(item, {}, "rug_ratio")),
+        risk_flags={key: item.get(key) for key in risk_keys if key in item},
+        raw=item,
+    )
+
+
+def parse_liquidity(chain: str, item: dict[str, Any]) -> GmgnLiquidity:
+    pool = _dict_or_empty(item.get("pool"))
+    price = _dict_or_empty(item.get("price"))
+    return GmgnLiquidity(
+        chain=chain,
+        token_address=_normalize_or_none(_first(item, pool, "base_address", "token_address", "address")),
+        pool_address=_normalize_or_none(_first(item, pool, "pool_address", "address")),
+        dex=_str_or_none(_first(item, pool, "exchange", "dex")),
+        liquidity_usd=_decimal_or_none(_first(item, pool, "liquidity", "liquidity_usd")),
+        base_reserve=_decimal_or_none(_first(item, pool, "base_reserve")),
+        quote_reserve=_decimal_or_none(_first(item, pool, "quote_reserve")),
+        quote_address=_normalize_or_none(_first(item, pool, "quote_address")),
+        quote_symbol=_str_or_none(_first(item, pool, "quote_symbol")),
+        price_usd=_decimal_or_none(_first(item, pool, "price", "price_usd")),
+        volume_24h_usd=_decimal_or_none(_first(item, price, "volume_24h", "volume24h")),
+        buy_volume_24h_usd=_decimal_or_none(_first(item, price, "buy_volume_24h", "buyVolume24h")),
+        sell_volume_24h_usd=_decimal_or_none(_first(item, price, "sell_volume_24h", "sellVolume24h")),
+        raw=item,
+    )
+
+
+def parse_holder(chain: str, item: dict[str, Any]) -> GmgnHolder:
+    return GmgnHolder(
+        chain=chain,
+        wallet_address=_normalize_or_none(_first(item, {}, "address", "wallet_address", "maker")),
+        balance=_decimal_or_none(_first(item, {}, "balance", "amount_cur")),
+        hold_percentage=_decimal_or_none(_first(item, {}, "amount_percentage", "hold_percentage")),
+        usd_value=_decimal_or_none(_first(item, {}, "usd_value")),
+        avg_cost_usd=_decimal_or_none(_first(item, {}, "avg_cost", "avg_cost_usd")),
+        realized_profit_usd=_decimal_or_none(_first(item, {}, "realized_profit", "realized_profit_usd")),
+        unrealized_profit_usd=_decimal_or_none(_first(item, {}, "unrealized_profit", "unrealized_profit_usd")),
+        buy_tx_count=_int_or_none(_first(item, {}, "buy_tx_count_cur", "buy_tx_count", "buy_count")),
+        sell_tx_count=_int_or_none(_first(item, {}, "sell_tx_count_cur", "sell_tx_count", "sell_count")),
+        start_holding_at=_int_or_none(_first(item, {}, "start_holding_at", "start_holding_timestamp")),
+        tags=_list_of_str(item.get("tags")),
+        maker_token_tags=_list_of_str(item.get("maker_token_tags")),
+        twitter_name=_str_or_none(_first(item, {}, "twitter_name", "name")),
+        twitter_username=_str_or_none(_first(item, {}, "twitter_username")),
+        raw=item,
+    )
+
+
+def parse_track_trade(item: dict[str, Any]) -> GmgnTrackTrade:
+    token = _token_obj(item)
+    maker_info = _dict_or_empty(item.get("maker_info"))
+    return GmgnTrackTrade(
+        chain=_str_or_none(_first(item, {}, "chain")),
+        wallet_address=_normalize_or_none(_first(item, maker_info, "maker", "address", "wallet_address")),
+        token_address=_normalize_or_none(_first(item, token, "base_address", "address", "token_address")),
+        symbol=_str_or_none(_first(token, item, "symbol", "base_symbol")),
+        side=_str_or_none(_first(item, {}, "side", "type")),
+        token_amount=_decimal_or_none(_first(item, {}, "token_amount", "base_amount")),
+        usd_value=_decimal_or_none(_first(item, {}, "amount_usd", "cost_usd", "usd_value")),
+        price_usd=_decimal_or_none(_first(item, {}, "price_usd")),
+        timestamp=_int_or_none(_first(item, {}, "timestamp", "time")),
+        tx_hash=_str_or_none(_first(item, {}, "transaction_hash", "tx_hash", "hash")),
+        open_or_close=_int_or_none(_first(item, {}, "is_open_or_close")),
+        wallet_tags=_list_of_str(maker_info.get("tags")),
+        twitter_username=_str_or_none(_first(maker_info, {}, "twitter_username")),
+        twitter_name=_str_or_none(_first(maker_info, {}, "twitter_name", "name")),
+        raw=item,
+    )
+
+
+def parse_market_signal(chain: str, item: dict[str, Any]) -> GmgnMarketSignal:
+    cur_data = _dict_or_empty(item.get("cur_data"))
+    return GmgnMarketSignal(
+        chain=chain,
+        event_id=_str_or_none(_first(item, {}, "id", "event_id", "signal_id")),
+        token_address=_normalize_or_none(_first(item, {}, "token_address", "address")),
+        signal_type=_int_or_none(_first(item, {}, "signal_type")),
+        trigger_at=_int_or_none(_first(item, {}, "trigger_at")),
+        trigger_market_cap_usd=_decimal_or_none(_first(item, {}, "trigger_mc", "first_trigger_mc")),
+        market_cap_usd=_decimal_or_none(_first(item, {}, "market_cap")),
+        liquidity_usd=_decimal_or_none(_first(cur_data, item, "liquidity")),
+        holder_count=_int_or_none(_first(cur_data, item, "holder_count")),
+        raw=item,
+    )
+
+
 def _build_message(
     path: str, query_params: dict[str, Any], body: str, timestamp: int
 ) -> str:
@@ -519,7 +983,19 @@ def _extract_items(data: Any) -> list[dict[str, Any]]:
         return [item for item in data if isinstance(item, dict)]
     if not isinstance(data, dict):
         return []
-    for key in ("items", "list", "data", "holdings", "activities", "result", "rows"):
+    for key in (
+        "items",
+        "list",
+        "rank",
+        "signals",
+        "tokens",
+        "followings",
+        "data",
+        "holdings",
+        "activities",
+        "result",
+        "rows",
+    ):
         value = data.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
@@ -546,6 +1022,47 @@ def _extract_next_cursor(data: Any) -> str | None:
     return None
 
 
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
+def _reset_delay_seconds(value: str) -> float | None:
+    try:
+        reset_at = float(value)
+    except ValueError:
+        return None
+    if reset_at <= 0:
+        return None
+    return max(0.0, reset_at - time.time())
+
+
+def _rate_limit_headers(response: httpx.Response) -> dict[str, str | None]:
+    lower_headers = {key.lower(): value for key, value in response.headers.items()}
+    return {
+        "limit": _first_header(lower_headers, "x-ratelimit-limit", "ratelimit-limit", "x-rate-limit-limit"),
+        "remaining": _first_header(
+            lower_headers,
+            "x-ratelimit-remaining",
+            "ratelimit-remaining",
+            "x-rate-limit-remaining",
+        ),
+        "reset": _first_header(lower_headers, "x-ratelimit-reset", "ratelimit-reset", "x-rate-limit-reset"),
+    }
+
+
+def _first_header(headers: dict[str, str], *names: str) -> str | None:
+    for name in names:
+        value = headers.get(name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _token_obj(item: dict[str, Any]) -> dict[str, Any]:
     value = item.get("token") or item.get("token_info") or item.get("base_token")
     return value if isinstance(value, dict) else {}
@@ -554,6 +1071,16 @@ def _token_obj(item: dict[str, Any]) -> dict[str, Any]:
 def _quote_obj(item: dict[str, Any]) -> dict[str, Any]:
     value = item.get("quote") or item.get("quote_token") or item.get("quote_info")
     return value if isinstance(value, dict) else {}
+
+
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _list_of_str(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item not in (None, "")]
 
 
 def _stats_sources(item: dict[str, Any]) -> list[dict[str, Any]]:

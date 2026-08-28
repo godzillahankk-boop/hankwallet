@@ -4,7 +4,7 @@ Wallet Agent 是一个面向链上交易用户的 AI 持仓监控与风险情报
 
 ## 当前版本
 
-V0.3.0 - Price Movement Guardian
+V0.4.0 - Attention Engine V1
 
 已实现：
 
@@ -24,8 +24,11 @@ V0.3.0 - Price Movement Guardian
 - 使用 GMGN Holdings 自动识别 Robinhood 当前持仓
 - Price Guardian 独立定时任务
 - 自动记录持仓 Token 价格快照
-- 5m / 15m / 60m 快速上涨、下跌 Telegram 主动提醒
-- Alert 去重、升级提醒、回落重置
+- 5m / 15m / 60m 价格异动进入 Attention 评分
+- Attention Engine 统一聚合 Price、Holder Structure、Smart Money、KOL、Liquidity
+- WARNING / CRITICAL 级别 Telegram 主动提醒
+- Attention Alert 去重、升级提醒、CRITICAL 冷却重发
+- Watch Session 隔离：重新买入同一 Token 不继承旧持仓周期的实时评分状态
 
 ## 环境要求
 
@@ -67,6 +70,7 @@ GMGN_API_KEY=
 GMGN_PRIVATE_KEY_PATH=
 
 PRICE_GUARDIAN_ENABLED=true
+PRICE_GUARDIAN_ALERTS_ENABLED=false
 PRICE_SCAN_INTERVAL_SECONDS=60
 PRICE_MONITOR_MIN_USD_VALUE=5
 PRICE_EXCLUDED_SYMBOLS=USDG,USDC,USDT,ETH,WETH
@@ -126,6 +130,7 @@ Price Guardian 使用 GMGN `wallet_holdings` 中的 `token.price` 作为价格�
 
 ```env
 PRICE_GUARDIAN_ENABLED=true
+PRICE_GUARDIAN_ALERTS_ENABLED=false
 PRICE_SCAN_INTERVAL_SECONDS=60
 PRICE_MONITOR_MIN_USD_VALUE=5
 PRICE_EXCLUDED_SYMBOLS=USDG,USDC,USDT,ETH,WETH
@@ -138,6 +143,8 @@ PRICE_ALERT_RESET_RATIO=0.5
 PRICE_HOLDINGS_MAX_PAGES=10
 PRICE_WALLET_CONCURRENCY=3
 ```
+
+V0.4 推荐保持 `PRICE_GUARDIAN_ENABLED=true`，让 Price Guardian 继续负责 GMGN Holdings、Trading Position Watch 和 PriceSnapshot 数据底座；同时保持 `PRICE_GUARDIAN_ALERTS_ENABLED=false`，避免旧固定阈值价格提醒和 Attention Engine 重复给 Telegram 发同类提醒。
 
 诊断当前钱包哪些 Token 会进入价格监控：
 
@@ -155,6 +162,70 @@ python scripts/price_guardian_probe.py 0x... --test-alert
 
 这条消息会明确标识为 `🧪 Price Guardian 测试提醒`，不会写入 `PriceAlertState`，也不会伪造成真实行情异动。
 
+## Attention Engine
+
+Attention Engine V1 使用 GMGN Read Only 数据源，把 Price、Holder Structure、Smart Money、KOL、Liquidity 事件统一转换成 Attention Assessment。它只判断“是否值得打扰用户”，不输出买入、卖出、加仓、清仓等交易建议。
+
+默认调度：
+
+```env
+ATTENTION_ENGINE_ENABLED=true
+ATTENTION_SMART_MONEY_INTERVAL_SECONDS=60
+ATTENTION_KOL_INTERVAL_SECONDS=60
+ATTENTION_MARKET_SIGNAL_INTERVAL_SECONDS=120
+ATTENTION_TOKEN_SNAPSHOT_DUE_SECONDS=600
+ATTENTION_TOKEN_SNAPSHOT_DISPATCH_SECONDS=120
+ATTENTION_TOP_HOLDER_DUE_SECONDS=900
+ATTENTION_TOP_HOLDER_DISPATCH_SECONDS=60
+ATTENTION_TOKEN_SNAPSHOT_BATCH_SIZE=3
+ATTENTION_TOP_HOLDER_BATCH_SIZE=1
+ATTENTION_FEED_WINDOW_MINUTES=15
+ATTENTION_EVENT_AGGREGATION_MINUTES=5
+ATTENTION_WARNING_COOLDOWN_MINUTES=30
+ATTENTION_CRITICAL_COOLDOWN_MINUTES=60
+```
+
+`DUE_SECONDS` 表示同一个 Token 至少间隔多久才允许再次采集；`DISPATCH_SECONDS` 表示 Scheduler 多久尝试处理下一小批 due Token。
+
+V0.4 正式运行推荐：
+
+```env
+GMGN_ENABLED=true
+PRICE_GUARDIAN_ENABLED=true
+PRICE_GUARDIAN_ALERTS_ENABLED=false
+PRICE_SCAN_INTERVAL_SECONDS=60
+ATTENTION_ENGINE_ENABLED=true
+ATTENTION_SMART_MONEY_INTERVAL_SECONDS=60
+ATTENTION_KOL_INTERVAL_SECONDS=60
+ATTENTION_MARKET_SIGNAL_INTERVAL_SECONDS=120
+ATTENTION_TOKEN_SNAPSHOT_DUE_SECONDS=600
+ATTENTION_TOKEN_SNAPSHOT_DISPATCH_SECONDS=120
+ATTENTION_TOKEN_SNAPSHOT_BATCH_SIZE=3
+ATTENTION_TOP_HOLDER_DUE_SECONDS=900
+ATTENTION_TOP_HOLDER_DISPATCH_SECONDS=60
+ATTENTION_TOP_HOLDER_BATCH_SIZE=1
+ATTENTION_FEED_WINDOW_MINUTES=15
+ATTENTION_EVENT_AGGREGATION_MINUTES=5
+ATTENTION_WARNING_COOLDOWN_MINUTES=30
+ATTENTION_CRITICAL_COOLDOWN_MINUTES=60
+```
+
+如果 `ATTENTION_ENGINE_ENABLED=true`，V0.4 要求 `PRICE_GUARDIAN_ENABLED=true`，否则启动会直接失败。`PRICE_GUARDIAN_ALERTS_ENABLED=false` 只关闭旧固定阈值价格 Telegram 提醒，不关闭 PriceSnapshot 和 Watch Session 数据采集。
+
+Telegram 调试最近一次评分：
+
+```text
+/attention WINK
+```
+
+开发期验证 Attention 与 Telegram 链路：
+
+```bash
+python scripts/attention_engine_probe.py --token 0x... --simulate --send-telegram
+```
+
+测试消息会明确标识为 `🧪 Attention Engine 测试提醒`，不写入真实 GMGN 数据或正式评估状态。
+
 ## 启动
 
 ```bash
@@ -165,7 +236,8 @@ python run.py
 
 - FastAPI health endpoint: `http://127.0.0.1:8000/health`
 - Telegram Bot polling
-- APScheduler Price Guardian 价格异动扫描
+- APScheduler Price Guardian 持仓识别和 PriceSnapshot 数据采集
+- APScheduler Attention Engine 异动情报扫描
 
 旧的 Blockscout/RPC 钱包自动扫描默认不注册后台 Scheduler job：
 
@@ -224,14 +296,14 @@ pytest
 - 暂无真实 PnL
 - 当前价格仅使用 GMGN Holdings 的 `token.price`
 - 暂无完整 Cost Basis / Avg Cost / PnL Guardian
-- 暂无流动性判断
 - 暂无 Dev Wallet / Dev X / Official X
-- 暂无 KOL 和社交热度
-- 暂无 Risk Score
+- 已有 GMGN KOL 链上 Feed V1，暂无社交平台 KOL 内容 / X 叙事分析
+- 已有 Liquidity Family V1，暂无更细的 LP migration / rug 自动判定
+- 暂无完整 Risk Score 产品化展示
 - 暂无 LLM 判断
 - 暂无自动交易
 - 当前默认 Blockscout v2 风格接口；不同 Explorer 可能需要调整 adapter
-- 原生 ETH 参与 swap 的精确识别需要更完整的交易和 receipt 解析，计划放到 V0.2
+- 旧 Blockscout/RPC transaction parser 保留为 fallback，复杂 swap 语义优先使用 GMGN 数据源
 
 ## 版本管理
 

@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.database import session_scope
-from app.db.models import PriceAlertState, PriceSnapshot, TokenWatchState, Wallet
+from app.db.models import AttentionAlertState, PriceAlertState, PriceSnapshot, TokenWatchState, Wallet
 from app.services.gmgn_client import GmgnClient, GmgnHolding
 from app.services.holding_classifier import is_trading_position
 from app.utils.time import utc_now
@@ -148,13 +148,16 @@ class PriceGuardianService:
             )
             if not wallet:
                 return result
-            held_contracts = self._held_contracts(holdings)
-            self._sync_watch_states(session, wallet, holdings, held_contracts, now)
-            for candidate in self.classify_holdings(holdings):
-                if not candidate.monitored:
+            trading_contracts = self._trading_contracts(holdings)
+            self._sync_watch_states(session, wallet, holdings, trading_contracts, now)
+            for holding in holdings:
+                if not self._is_watchable_trading_holding(holding):
                     continue
-                holding = candidate.holding
-                if not holding.contract_address or holding.balance is None or holding.current_price_usd is None:
+                if (
+                    holding.current_price_usd is None
+                    or holding.current_price_usd <= 0
+                    or holding.balance is None
+                ):
                     continue
                 watch_state = self._active_watch_state(session, wallet.id, holding.contract_address)
                 if not watch_state:
@@ -170,9 +173,16 @@ class PriceGuardianService:
                     observed_at=now,
                 )
                 session.add(snapshot)
-                result.monitored_tokens += 1
                 result.snapshots_saved += 1
-                token_alert = self._evaluate_alerts(session, wallet, holding, watch_state, now)
+                candidate = self.classify_holding(holding)
+                if not candidate.monitored:
+                    continue
+                result.monitored_tokens += 1
+                token_alert = (
+                    self._evaluate_alerts(session, wallet, holding, watch_state, now)
+                    if send_alerts and self.settings.price_guardian_alerts_enabled
+                    else None
+                )
                 if token_alert:
                     alerts.append(token_alert)
             logger.info(
@@ -183,7 +193,7 @@ class PriceGuardianService:
                 result.snapshots_saved,
             )
 
-        if send_alerts:
+        if send_alerts and self.settings.price_guardian_alerts_enabled:
             for alert in alerts:
                 try:
                     await self._send_alert(alert)
@@ -249,25 +259,35 @@ class PriceGuardianService:
             return MonitorCandidate(holding, False, "SKIPPED_NON_POSITIVE_PRICE")
         return MonitorCandidate(holding, True, "MONITORED")
 
-    def _held_contracts(self, holdings: list[GmgnHolding]) -> set[str]:
+    def _trading_contracts(self, holdings: list[GmgnHolding]) -> set[str]:
         held: set[str] = set()
         for holding in holdings:
-            if holding.contract_address and holding.balance is not None and holding.balance > 0:
+            if self._is_watchable_trading_holding(holding):
                 held.add(holding.contract_address)
         return held
+
+    def _is_watchable_trading_holding(self, holding: GmgnHolding) -> bool:
+        symbol = (holding.symbol or "").upper()
+        return (
+            holding.contract_address is not None
+            and holding.balance is not None
+            and holding.balance > 0
+            and symbol not in self.settings.price_excluded_symbols
+            and is_trading_position(holding)
+        )
 
     def _sync_watch_states(
         self,
         session,
         wallet: Wallet,
         holdings: list[GmgnHolding],
-        held_contracts: set[str],
+        trading_contracts: set[str],
         observed_at,
     ) -> None:
         holdings_by_contract = {
             holding.contract_address: holding
             for holding in holdings
-            if holding.contract_address and holding.balance is not None and holding.balance > 0
+            if holding.contract_address in trading_contracts
         }
         active_states = list(
             session.scalars(
@@ -278,7 +298,7 @@ class PriceGuardianService:
             )
         )
         for state in active_states:
-            if state.token_address not in held_contracts:
+            if state.token_address not in trading_contracts:
                 state.active = False
                 state.ended_at = observed_at
         for contract, holding in holdings_by_contract.items():
@@ -299,6 +319,7 @@ class PriceGuardianService:
             session.add(state)
             session.flush()
             self._reset_alert_states_for_token(session, wallet.id, contract, observed_at)
+            self._reset_attention_alert_state_for_token(session, wallet.id, contract)
 
     def _active_watch_state(
         self, session, wallet_id: int, token_address: str
@@ -517,6 +538,16 @@ class PriceGuardianService:
             state.last_alert_at = None
             state.last_alert_change_pct = None
             state.updated_at = observed_at
+
+    def _reset_attention_alert_state_for_token(
+        self, session, wallet_id: int, token_address: str
+    ) -> None:
+        session.execute(
+            delete(AttentionAlertState).where(
+                AttentionAlertState.wallet_id == wallet_id,
+                AttentionAlertState.token_address == token_address,
+            )
+        )
 
     def _find_state(
         self,

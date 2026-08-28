@@ -87,6 +87,18 @@ def settings(tmp_path) -> Settings:
         price_alert_reset_ratio=Decimal("0.5"),
         price_holdings_max_pages=10,
         price_wallet_concurrency=3,
+        attention_engine_enabled=True,
+        attention_smart_money_interval_seconds=60,
+        attention_kol_interval_seconds=60,
+        attention_market_signal_interval_seconds=120,
+        attention_token_snapshot_interval_seconds=600,
+        attention_top_holder_interval_seconds=900,
+        attention_token_snapshot_batch_size=3,
+        attention_top_holder_batch_size=1,
+        attention_feed_window_minutes=15,
+        attention_event_aggregation_minutes=5,
+        attention_warning_cooldown_minutes=30,
+        attention_critical_cooldown_minutes=60,
     )
 
 

@@ -42,6 +42,7 @@ from app.bot.messages import (
 from app.core.config import Settings
 from app.db.database import session_scope
 from app.db.models import User, Wallet
+from app.services.attention_engine_service import AttentionEngineService, format_attention_debug
 from app.services.balance_service import BalanceService
 from app.services.gmgn_client import GmgnHolding
 from app.services.monitoring_service import MonitoringService
@@ -59,15 +60,18 @@ def build_application(
     session_factory: sessionmaker,
     monitoring_service: MonitoringService,
     price_guardian_service: PriceGuardianService | None = None,
+    attention_engine_service: AttentionEngineService | None = None,
 ) -> Application:
     application = Application.builder().token(settings.telegram_bot_token).build()
     application.bot_data["session_factory"] = session_factory
     application.bot_data["monitoring_service"] = monitoring_service
     application.bot_data["price_guardian_service"] = price_guardian_service
+    application.bot_data["attention_engine_service"] = attention_engine_service
     application.bot_data["settings"] = settings
     application.bot_data["manual_scan_at"] = {}
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("attention", attention_debug))
     application.add_handler(
         ConversationHandler(
             entry_points=[
@@ -347,6 +351,47 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def settings_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(SETTINGS_MESSAGE, reply_markup=main_menu_keyboard())
+
+
+async def attention_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    attention_engine_service: AttentionEngineService | None = context.application.bot_data.get(
+        "attention_engine_service"
+    )
+    if not attention_engine_service:
+        await update.message.reply_text(
+            "Attention Engine 当前未启用。",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    symbol = " ".join(context.args).strip() if context.args else ""
+    if not symbol:
+        await update.message.reply_text(
+            "请输入：/attention SYMBOL",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    assessments = attention_engine_service.latest_assessment_for_symbol(
+        update.effective_user.id,
+        symbol,
+    )
+    if not assessments:
+        await update.message.reply_text(
+            f"没有找到 {symbol.upper()} 的 Attention 评估。",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    if len(assessments) > 1:
+        lines = [f"{symbol.upper()} 匹配到多个持仓，请使用更明确的Symbol后再试。", ""]
+        for assessment in assessments[:5]:
+            lines.append(f"{assessment.symbol or '-'} {assessment.token_address}")
+        await update.message.reply_text("\n".join(lines), reply_markup=main_menu_keyboard())
+        return
+    await update.message.reply_text(
+        format_attention_debug(assessments[0]),
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

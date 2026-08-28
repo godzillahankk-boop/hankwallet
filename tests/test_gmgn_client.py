@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 import httpx
@@ -8,11 +9,19 @@ import pytest
 from app.services import gmgn_client as gmgn_module
 from app.services.gmgn_client import (
     GmgnAuthError,
+    GmgnApiError,
     GmgnClient,
+    GmgnRateLimitError,
     _load_private_key_pem,
     parse_activity,
+    parse_holder,
     parse_holding,
+    parse_liquidity,
+    parse_market_signal,
     parse_stats,
+    parse_token_overview,
+    parse_token_security,
+    parse_track_trade,
 )
 
 WALLET = "0x0e712f06daeab2e866b1477923764af2fc1a9f67"
@@ -138,6 +147,318 @@ def test_empty_fields_parse_as_none() -> None:
     assert holding.cost_usd is None
     assert activity.token_amount is None
     assert activity.tx_hash is None
+
+
+def test_token_overview_parser() -> None:
+    overview = parse_token_overview(
+        "robinhood",
+        {
+            "address": TOKEN,
+            "symbol": "WINK",
+            "name": "WinkCat",
+            "circulating_supply": "1000000",
+            "price": {"price": "0.0002"},
+            "liquidity": "12345.6",
+            "holder_count": 321,
+            "stat": {"top_10_holder_rate": "0.12"},
+            "wallet_tags_stat": {"smart_degen_wallets": 3, "renowned_wallets": 2},
+            "dev": {"creator_address": "0x3333333333333333333333333333333333333333"},
+            "creation_timestamp": 1770000000,
+            "link": {"twitter_username": "wink", "telegram": "https://t.me/wink", "website": "https://wink.example"},
+        },
+    )
+
+    assert overview.token_address == TOKEN
+    assert overview.price_usd == Decimal("0.0002")
+    assert overview.market_cap_usd == Decimal("200.0000")
+    assert overview.top10_holder_rate == Decimal("0.12")
+    assert overview.smart_money_count == 3
+    assert overview.kol_count == 2
+    assert overview.twitter == "wink"
+
+
+def test_token_security_parser() -> None:
+    security = parse_token_security(
+        "robinhood",
+        {
+            "address": TOKEN,
+            "is_honeypot": "no",
+            "open_source": "yes",
+            "owner": "0x4444444444444444444444444444444444444444",
+            "owner_renounced": "unknown",
+            "buy_tax": "0.01",
+            "sell_tax": "0.02",
+            "top_10_holder_rate": "0.12",
+            "rug_ratio": "0.05",
+            "is_wash_trading": False,
+            "sniper_count": 7,
+        },
+    )
+
+    assert security.is_honeypot == "no"
+    assert security.buy_tax == Decimal("0.01")
+    assert security.rug_ratio == Decimal("0.05")
+    assert security.risk_flags["is_wash_trading"] is False
+    assert security.risk_flags["sniper_count"] == 7
+
+
+def test_liquidity_parser() -> None:
+    liquidity = parse_liquidity(
+        "robinhood",
+        {
+            "address": "0x5555555555555555555555555555555555555555",
+            "base_address": TOKEN,
+            "quote_address": USDG,
+            "quote_symbol": "USDG",
+            "exchange": "rhex",
+            "liquidity": "9999.5",
+            "base_reserve": "100",
+            "quote_reserve": "50",
+            "price": "0.5",
+            "volume_24h": "1234",
+        },
+    )
+
+    assert liquidity.token_address == TOKEN
+    assert liquidity.dex == "rhex"
+    assert liquidity.liquidity_usd == Decimal("9999.5")
+    assert liquidity.volume_24h_usd == Decimal("1234")
+
+
+def test_holder_smart_money_and_kol_parser() -> None:
+    holder = parse_holder(
+        "robinhood",
+        {
+            "address": WALLET,
+            "balance": "100",
+            "amount_percentage": "0.05",
+            "usd_value": "25",
+            "avg_cost": "0.2",
+            "realized_profit": "3",
+            "unrealized_profit": "-1",
+            "buy_tx_count_cur": 2,
+            "sell_tx_count_cur": 1,
+            "start_holding_at": 1770000000,
+            "tags": ["smart_degen", "renowned"],
+            "maker_token_tags": ["top_holder"],
+            "twitter_username": "holder_x",
+        },
+    )
+
+    assert holder.wallet_address == WALLET
+    assert holder.hold_percentage == Decimal("0.05")
+    assert holder.tags == ["smart_degen", "renowned"]
+    assert holder.maker_token_tags == ["top_holder"]
+    assert holder.twitter_username == "holder_x"
+
+
+def test_track_feed_parser() -> None:
+    trade = parse_track_trade(track_feed_fixture())
+
+    assert trade.wallet_address == WALLET
+    assert trade.token_address == TOKEN
+    assert trade.symbol == "WINK"
+    assert trade.usd_value == Decimal("12.5")
+    assert trade.wallet_tags == ["smart_degen"]
+
+
+def test_kol_feed_parser() -> None:
+    trade = parse_track_trade(
+        {
+            "chain": "robinhood",
+            "transaction_hash": "0xkol",
+            "maker": WALLET,
+            "side": "sell",
+            "base_address": TOKEN,
+            "token_amount": "250",
+            "amount_usd": "8.75",
+            "price_usd": "0.035",
+            "timestamp": 1770000010,
+            "is_open_or_close": 1,
+            "base_token": {"symbol": "WINK"},
+            "maker_info": {
+                "tags": ["renowned"],
+                "twitter_username": "kol_x",
+                "twitter_name": "KOL X",
+            },
+        },
+    )
+
+    assert trade.side == "sell"
+    assert trade.open_or_close == 1
+    assert trade.twitter_username == "kol_x"
+    assert trade.twitter_name == "KOL X"
+
+
+def test_market_signal_parser() -> None:
+    signal = parse_market_signal(
+        "robinhood",
+        {
+            "id": "signal-1",
+            "token_address": TOKEN,
+            "signal_type": 12,
+            "trigger_at": 1770000000,
+            "trigger_mc": "100000",
+            "market_cap": "120000",
+            "cur_data": {"liquidity": "20000", "holder_count": 500},
+        },
+    )
+
+    assert signal.event_id == "signal-1"
+    assert signal.token_address == TOKEN
+    assert signal.signal_type == 12
+    assert signal.trigger_market_cap_usd == Decimal("100000")
+    assert signal.liquidity_usd == Decimal("20000")
+
+
+@pytest.mark.asyncio
+async def test_intelligence_methods_and_empty_results() -> None:
+    client = make_client(
+        [
+            {"code": 0, "data": {"list": []}},
+            {"code": 0, "data": {"list": []}},
+            {"code": 0, "data": []},
+        ]
+    )
+
+    holders = await client.get_token_holders("robinhood", TOKEN, tag="smart_degen")
+    feed = await client.get_track_feed("smartmoney", chain="robinhood")
+    signals = await client.get_market_signals("robinhood", groups=[{"signal_type": [12]}])
+
+    assert holders == []
+    assert feed == []
+    assert signals == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_market_signal_body_and_api_error() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = request.content.decode()
+        return httpx.Response(400, json={"code": 400, "error": "bad_group"}, request=request)
+
+    client = GmgnClient(api_key="test-api-key", base_url="https://gmgn.test")
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(GmgnApiError):
+        await client.get_market_signals("robinhood", groups=[{"signal_type": [14]}])
+
+    assert seen["path"] == "/v1/market/token_signal"
+    assert json.loads(seen["body"]) == {"chain": "robinhood", "groups": [{"signal_type": [14]}]}
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retry_after_is_obeyed(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(gmgn_module.asyncio, "sleep", fake_sleep)
+
+    seen = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["count"] += 1
+        if seen["count"] == 1:
+            return httpx.Response(
+                429,
+                json={"code": 429, "error": "too many requests"},
+                headers={
+                    "Retry-After": "7",
+                    "X-RateLimit-Limit": "20",
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": "1780000000",
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"code": 0, "data": {"list": [track_feed_fixture()]}},
+            request=request,
+        )
+
+    client = GmgnClient(
+        api_key="test-api-key",
+        base_url="https://gmgn.test",
+        rate_limit_max_retries=1,
+    )
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    trades = await client.get_track_feed("smartmoney", chain="robinhood")
+
+    assert sleeps == [7.0]
+    assert len(trades) == 1
+    assert trades[0].tx_hash == "0xabc"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_without_retry_after_uses_backoff(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(gmgn_module.asyncio, "sleep", fake_sleep)
+
+    seen = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["count"] += 1
+        if seen["count"] == 1:
+            return httpx.Response(429, json={"code": 429}, request=request)
+        return httpx.Response(200, json={"code": 0, "data": {"list": []}}, request=request)
+
+    client = GmgnClient(
+        api_key="test-api-key",
+        base_url="https://gmgn.test",
+        rate_limit_max_retries=1,
+        rate_limit_backoff_seconds=(0.25,),
+    )
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert await client.get_track_feed("smartmoney", chain="robinhood") == []
+    assert sleeps == [0.25]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_max_retries_raises_and_is_not_empty(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(gmgn_module.asyncio, "sleep", fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"code": 429, "error": "rate limit"},
+            headers={"X-RateLimit-Remaining": "0"},
+            request=request,
+        )
+
+    client = GmgnClient(
+        api_key="test-api-key",
+        base_url="https://gmgn.test",
+        rate_limit_max_retries=1,
+        rate_limit_backoff_seconds=(0.1,),
+    )
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(GmgnRateLimitError) as exc_info:
+        await client.get_track_feed("smartmoney", chain="robinhood")
+
+    assert "HTTP 429" in str(exc_info.value)
+    assert exc_info.value.remaining == "0"
+    assert sleeps == [0.1]
+    await client.aclose()
 
 
 def test_robinhood_holdings_raw_fields_parse_without_inventing_cost() -> None:
@@ -394,4 +715,21 @@ def transfer_in_fixture() -> dict:
         "from": "0x2222222222222222222222222222222222222222",
         "to": WALLET,
         "tx_hash": "0xtransferin",
+    }
+
+
+def track_feed_fixture() -> dict:
+    return {
+        "chain": "robinhood",
+        "transaction_hash": "0xabc",
+        "maker": WALLET,
+        "side": "buy",
+        "base_address": TOKEN,
+        "token_amount": "1000",
+        "amount_usd": "12.5",
+        "price_usd": "0.0125",
+        "timestamp": 1770000000,
+        "is_open_or_close": 0,
+        "base_token": {"symbol": "WINK"},
+        "maker_info": {"tags": ["smart_degen"], "twitter_username": "smart_x"},
     }

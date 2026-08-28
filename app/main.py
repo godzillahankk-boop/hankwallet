@@ -11,6 +11,7 @@ from app.core.config import load_settings
 from app.core.scheduler import build_scheduler
 from app.db.database import init_db, make_engine, make_session_factory
 from app.services.chain_client import build_chain_client
+from app.services.attention_engine_service import AttentionEngineService
 from app.services.gmgn_client import GmgnClient
 from app.services.monitoring_service import MonitoringService
 from app.services.price_guardian_service import PriceGuardianService
@@ -26,6 +27,7 @@ async def health() -> dict[str, str]:
 
 async def run() -> None:
     settings = load_settings()
+    validate_runtime_settings(settings)
     setup_logging(settings.log_level)
     logger = logging.getLogger(__name__)
     logger.info("App startup")
@@ -59,22 +61,36 @@ async def run() -> None:
     )
     gmgn_client = None
     price_guardian_service = None
-    if settings.gmgn_enabled and settings.price_guardian_enabled:
+    attention_engine_service = None
+    if settings.gmgn_enabled and (settings.price_guardian_enabled or settings.attention_engine_enabled):
         try:
             gmgn_client = GmgnClient.from_settings(settings)
-            price_guardian_service = PriceGuardianService(
-                session_factory=session_factory,
-                gmgn_client=gmgn_client,
-                settings=settings,
-                notifier=notify,
+            gmgn_client.min_request_interval_seconds = max(
+                gmgn_client.min_request_interval_seconds,
+                1.0,
             )
+            if settings.price_guardian_enabled:
+                price_guardian_service = PriceGuardianService(
+                    session_factory=session_factory,
+                    gmgn_client=gmgn_client,
+                    settings=settings,
+                    notifier=notify,
+                )
+            if settings.attention_engine_enabled:
+                attention_engine_service = AttentionEngineService(
+                    session_factory=session_factory,
+                    gmgn_client=gmgn_client,
+                    settings=settings,
+                    notifier=notify,
+                )
         except Exception as exc:
-            logger.exception("GMGN error Price Guardian disabled during startup: %s", exc)
+            logger.exception("GMGN error GMGN-backed services disabled during startup: %s", exc)
     telegram_app = build_application(
         settings,
         session_factory,
         monitoring_service,
         price_guardian_service,
+        attention_engine_service,
     )
     telegram_app_holder["app"] = telegram_app
     scheduler = build_scheduler(
@@ -82,6 +98,7 @@ async def run() -> None:
         session_factory,
         monitoring_service,
         price_guardian_service,
+        attention_engine_service,
     )
 
     await telegram_app.initialize()
@@ -112,6 +129,11 @@ async def run() -> None:
         if gmgn_client:
             await gmgn_client.aclose()
         await chain_client.aclose()
+
+
+def validate_runtime_settings(settings) -> None:
+    if settings.attention_engine_enabled and not settings.price_guardian_enabled:
+        raise RuntimeError("ATTENTION_ENGINE_ENABLED requires PRICE_GUARDIAN_ENABLED in V0.4")
 
 
 def main() -> None:

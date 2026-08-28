@@ -43,6 +43,23 @@ class Settings:
     price_alert_reset_ratio: Decimal
     price_holdings_max_pages: int
     price_wallet_concurrency: int
+    attention_engine_enabled: bool
+    attention_smart_money_interval_seconds: int
+    attention_kol_interval_seconds: int
+    attention_market_signal_interval_seconds: int
+    attention_token_snapshot_interval_seconds: int
+    attention_top_holder_interval_seconds: int
+    attention_token_snapshot_batch_size: int
+    attention_top_holder_batch_size: int
+    attention_feed_window_minutes: int
+    attention_event_aggregation_minutes: int
+    attention_warning_cooldown_minutes: int
+    attention_critical_cooldown_minutes: int
+    attention_token_snapshot_due_seconds: int = 600
+    attention_token_snapshot_dispatch_seconds: int = 120
+    attention_top_holder_due_seconds: int = 900
+    attention_top_holder_dispatch_seconds: int = 60
+    price_guardian_alerts_enabled: bool = False
 
 
 def _get_int(name: str, default: int) -> int:
@@ -112,4 +129,27 @@ def load_settings() -> Settings:
         price_alert_reset_ratio=_get_decimal("PRICE_ALERT_RESET_RATIO", "0.5"),
         price_holdings_max_pages=_get_int("PRICE_HOLDINGS_MAX_PAGES", 10),
         price_wallet_concurrency=_get_int("PRICE_WALLET_CONCURRENCY", 3),
+        attention_engine_enabled=_get_bool("ATTENTION_ENGINE_ENABLED", True),
+        attention_smart_money_interval_seconds=_get_int("ATTENTION_SMART_MONEY_INTERVAL_SECONDS", 60),
+        attention_kol_interval_seconds=_get_int("ATTENTION_KOL_INTERVAL_SECONDS", 60),
+        attention_market_signal_interval_seconds=_get_int("ATTENTION_MARKET_SIGNAL_INTERVAL_SECONDS", 120),
+        attention_token_snapshot_interval_seconds=_get_int("ATTENTION_TOKEN_SNAPSHOT_INTERVAL_SECONDS", 600),
+        attention_top_holder_interval_seconds=_get_int("ATTENTION_TOP_HOLDER_INTERVAL_SECONDS", 900),
+        attention_token_snapshot_batch_size=_get_int("ATTENTION_TOKEN_SNAPSHOT_BATCH_SIZE", 3),
+        attention_top_holder_batch_size=_get_int("ATTENTION_TOP_HOLDER_BATCH_SIZE", 1),
+        attention_feed_window_minutes=_get_int("ATTENTION_FEED_WINDOW_MINUTES", 15),
+        attention_event_aggregation_minutes=_get_int("ATTENTION_EVENT_AGGREGATION_MINUTES", 5),
+        attention_warning_cooldown_minutes=_get_int("ATTENTION_WARNING_COOLDOWN_MINUTES", 30),
+        attention_critical_cooldown_minutes=_get_int("ATTENTION_CRITICAL_COOLDOWN_MINUTES", 60),
+        attention_token_snapshot_due_seconds=_get_int(
+            "ATTENTION_TOKEN_SNAPSHOT_DUE_SECONDS",
+            _get_int("ATTENTION_TOKEN_SNAPSHOT_INTERVAL_SECONDS", 600),
+        ),
+        attention_token_snapshot_dispatch_seconds=_get_int("ATTENTION_TOKEN_SNAPSHOT_DISPATCH_SECONDS", 120),
+        attention_top_holder_due_seconds=_get_int(
+            "ATTENTION_TOP_HOLDER_DUE_SECONDS",
+            _get_int("ATTENTION_TOP_HOLDER_INTERVAL_SECONDS", 900),
+        ),
+        attention_top_holder_dispatch_seconds=_get_int("ATTENTION_TOP_HOLDER_DISPATCH_SECONDS", 60),
+        price_guardian_alerts_enabled=_get_bool("PRICE_GUARDIAN_ALERTS_ENABLED", False),
     )
