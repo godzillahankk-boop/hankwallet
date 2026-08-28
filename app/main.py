@@ -69,19 +69,22 @@ async def run() -> None:
                 gmgn_client.min_request_interval_seconds,
                 1.0,
             )
-            if settings.price_guardian_enabled:
-                price_guardian_service = PriceGuardianService(
-                    session_factory=session_factory,
-                    gmgn_client=gmgn_client,
-                    settings=settings,
-                    notifier=notify,
-                )
             if settings.attention_engine_enabled:
                 attention_engine_service = AttentionEngineService(
                     session_factory=session_factory,
                     gmgn_client=gmgn_client,
                     settings=settings,
                     notifier=notify,
+                )
+            if settings.price_guardian_enabled:
+                price_guardian_service = PriceGuardianService(
+                    session_factory=session_factory,
+                    gmgn_client=gmgn_client,
+                    settings=settings,
+                    notifier=notify,
+                    price_attention_trigger=attention_engine_service.handle_price_snapshot_update
+                    if attention_engine_service
+                    else None,
                 )
         except Exception as exc:
             logger.exception("GMGN error GMGN-backed services disabled during startup: %s", exc)

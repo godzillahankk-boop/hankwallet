@@ -1678,6 +1678,281 @@ async def test_current_session_assessment_sends_and_marks(ctx) -> None:
         assert state.last_direction == scoring.NEGATIVE
 
 
+@pytest.mark.asyncio
+async def test_price_snapshot_update_without_price_score_does_not_assess(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="50", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="0.98", usd_value="49", observed_at=now)
+    add_token_intel(
+        session_factory,
+        wallet_id,
+        market_cap="32033",
+        liquidity="14788",
+        observed_at=now,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is None
+    with session_scope(session_factory) as session:
+        assert session.scalar(select(AttentionAssessment)) is None
+
+
+@pytest.mark.asyncio
+async def test_price_snapshot_update_with_price_score_assesses_and_notifies(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="600", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="0.65", usd_value="390", observed_at=now)
+    add_token_intel(
+        session_factory,
+        wallet_id,
+        market_cap="32033",
+        liquidity="14788",
+        observed_at=now,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.price_score > 0
+    assert assessment.should_notify is True
+    assert len(sent) == 1
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["assessment_trigger"] == "price_threshold"
+
+
+@pytest.mark.asyncio
+async def test_usd_threshold_crossing_allows_one_below_min_assessment(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="12", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="0.2", usd_value="2", observed_at=now)
+    add_token_intel(
+        session_factory,
+        wallet_id,
+        market_cap="32033",
+        liquidity="14788",
+        observed_at=now,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.price_score == 40
+    assert assessment.position_exposure_score == 0
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["assessment_trigger"] == "usd_threshold_crossing"
+
+
+@pytest.mark.asyncio
+async def test_below_min_without_crossing_does_not_price_trigger(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="2", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="0.5", usd_value="1", observed_at=now)
+    add_token_intel(session_factory, wallet_id, observed_at=now)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is None
+    with session_scope(session_factory) as session:
+        assert session.scalar(select(AttentionAssessment)) is None
+
+
+@pytest.mark.asyncio
+async def test_below_min_first_session_snapshot_is_not_crossing(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=1))
+    add_price_snapshot(session_factory, wallet_id, price="0.2", usd_value="2", observed_at=now)
+    add_token_intel(session_factory, wallet_id, observed_at=now)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is None
+
+
+@pytest.mark.asyncio
+async def test_usd_threshold_crossing_does_not_use_old_watch_session_previous_snapshot(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    old_start = now - timedelta(minutes=20)
+    with session_scope(session_factory) as session:
+        session.add(
+            TokenWatchState(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                active=False,
+                started_at=old_start,
+                last_seen_at=now - timedelta(minutes=2),
+                ended_at=now - timedelta(minutes=2),
+            )
+        )
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="12", observed_at=now - timedelta(minutes=5))
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=1))
+    add_price_snapshot(session_factory, wallet_id, price="0.2", usd_value="2", observed_at=now)
+    add_token_intel(session_factory, wallet_id, observed_at=now)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is None
+
+
+@pytest.mark.asyncio
+async def test_autism_incident_regression_crossing_price_and_smart_money_warns(ctx, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.attention_engine_service.ATTENTION_NOTIFICATION_RETRY_DELAYS_SECONDS",
+        (0,),
+    )
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, token=TOKEN, symbol="Autism", started_at=now - timedelta(minutes=10))
+    add_price_snapshot(
+        session_factory,
+        wallet_id,
+        token=TOKEN,
+        symbol="Autism",
+        price="0.000032253613",
+        usd_value="12.85",
+        observed_at=now - timedelta(minutes=5),
+    )
+    add_price_snapshot(
+        session_factory,
+        wallet_id,
+        token=TOKEN,
+        symbol="Autism",
+        price="0.0000043569864",
+        usd_value="1.74",
+        observed_at=now,
+    )
+    add_token_intel(
+        session_factory,
+        wallet_id,
+        token=TOKEN,
+        symbol="Autism",
+        market_cap="32033.17",
+        liquidity="14788.223660170645",
+        observed_at=now,
+    )
+    with session_scope(session_factory) as session:
+        for index in range(8):
+            session.add(
+                IntelligenceEvent(
+                    wallet_id=wallet_id,
+                    chain="robinhood",
+                    token_address=TOKEN,
+                    symbol="Autism",
+                    family=scoring.SMART_MONEY,
+                    event_type="smartmoney_trade",
+                    direction=scoring.NEGATIVE,
+                    severity_score=0,
+                    source="gmgn_smartmoney",
+                    source_event_id=f"autism-sell-{index}",
+                    event_fingerprint=f"autism-sell-{index}",
+                    event_at=now - timedelta(seconds=20 + index),
+                    detected_at=now,
+                    payload_json=json.dumps(
+                        {
+                            "wallet": f"0x{index:040x}",
+                            "side": "sell",
+                            "usd_value": str(Decimal("2316.60") / Decimal("8")),
+                        }
+                    ),
+                )
+            )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.price_score == 40
+    assert assessment.smart_money_score == 25
+    assert assessment.attention_level in {scoring.WARNING, scoring.CRITICAL}
+    assert assessment.should_notify is True
+    assert len(sent) == 1
+    assert "Autism" in sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_crossing_does_not_force_warning_without_other_strength(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="12", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="0.2", usd_value="2", observed_at=now)
+    add_token_intel(
+        session_factory,
+        wallet_id,
+        market_cap="32033",
+        liquidity="14788",
+        observed_at=now,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.price_score == 40
+    assert assessment.attention_level == scoring.NOTICE
+    assert assessment.should_notify is False
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_crossing_is_one_time_while_value_stays_below_min(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="12", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="0.2", usd_value="2", observed_at=now)
+    add_token_intel(session_factory, wallet_id, market_cap="32033", liquidity="14788", observed_at=now)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    first = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+    add_price_snapshot(session_factory, wallet_id, price="0.18", usd_value="1.8", observed_at=now + timedelta(minutes=1))
+    second = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert first is not None
+    assert second is None
+    with session_scope(session_factory) as session:
+        assert len(list(session.scalars(select(AttentionAssessment)))) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_above_min_restores_normal_price_trigger(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", usd_value="12", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="0.2", usd_value="2", observed_at=now)
+    add_token_intel(session_factory, wallet_id, market_cap="32033", liquidity="14788", observed_at=now)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    crossing = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+    add_price_snapshot(session_factory, wallet_id, price="0.6", usd_value="6", observed_at=now + timedelta(minutes=5))
+    recovered = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert crossing is not None
+    assert recovered is not None
+    assert recovered.price_score > 0
+    evidence = json.loads(recovered.evidence_json)
+    assert evidence["assessment_trigger"] == "price_threshold"
+
+
 def test_fingerprint_is_stable() -> None:
     assert fingerprint_event("a", "b", 1) == fingerprint_event("a", "b", 1)
     assert fingerprint_event("a", "b", 1) != fingerprint_event("a", "b", 2)

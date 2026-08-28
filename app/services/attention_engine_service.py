@@ -179,11 +179,20 @@ class AttentionEngineService:
         await self.cleanup_old_snapshots()
         return result
 
-    async def assess_token(self, wallet_id: int, token_address: str) -> AttentionAssessment | None:
+    async def assess_token(
+        self,
+        wallet_id: int,
+        token_address: str,
+        *,
+        allow_below_min_value: bool = False,
+        assessment_trigger: str | None = None,
+    ) -> AttentionAssessment | None:
         now = utc_now()
         with session_scope(self.session_factory) as session:
             watched = self._watched_token(session, wallet_id, token_address)
-            if not watched or watched.usd_value is None or watched.usd_value < self.settings.price_monitor_min_usd_value:
+            if not watched or watched.usd_value is None:
+                return None
+            if watched.usd_value < self.settings.price_monitor_min_usd_value and not allow_below_min_value:
                 return None
             latest_price = self._latest_price_snapshot(session, wallet_id, token_address, watched.watch_started_at)
             latest_intel = self._latest_token_snapshot(session, wallet_id, token_address, watched.watch_started_at)
@@ -262,6 +271,7 @@ class AttentionEngineService:
                 price_change,
                 price_window,
                 watched.watch_started_at,
+                assessment_trigger,
             )
             should_notify = self._should_notify(session, wallet_id, token_address, level, final, direction, family_scores, now)
             assessment = AttentionAssessment(
@@ -298,6 +308,56 @@ class AttentionEngineService:
             session.flush()
             session.expunge(assessment)
             return assessment
+
+    async def handle_price_snapshot_update(self, wallet_id: int, token_address: str) -> AttentionAssessment | None:
+        trigger: str | None = None
+        allow_below_min_value = False
+        with session_scope(self.session_factory) as session:
+            watched = self._watched_token(session, wallet_id, token_address)
+            if not watched:
+                return None
+            latest_price = self._latest_price_snapshot(session, wallet_id, token_address, watched.watch_started_at)
+            if not latest_price:
+                return None
+            current_usd = _decimal_or_none(latest_price.usd_value)
+            if current_usd is None:
+                return None
+            previous = self._previous_price_snapshot(
+                session,
+                wallet_id,
+                token_address,
+                watched.watch_started_at,
+                latest_price.observed_at,
+            )
+            previous_usd = _decimal_or_none(previous.usd_value if previous else None)
+            min_usd = self.settings.price_monitor_min_usd_value
+            if current_usd >= min_usd:
+                latest_intel = self._latest_token_snapshot(session, wallet_id, token_address, watched.watch_started_at)
+                price_score, _, _, _ = self._price_family(
+                    session,
+                    wallet_id,
+                    token_address,
+                    latest_intel,
+                    watched.watch_started_at,
+                )
+                if price_score <= 0:
+                    return None
+                trigger = "price_threshold"
+            elif previous_usd is not None and previous_usd >= min_usd:
+                allow_below_min_value = True
+                trigger = "usd_threshold_crossing"
+            else:
+                return None
+
+        assessment = await self.assess_token(
+            wallet_id,
+            token_address,
+            allow_below_min_value=allow_below_min_value,
+            assessment_trigger=trigger,
+        )
+        if assessment and assessment.should_notify:
+            await self._notify_assessment(assessment)
+        return assessment
 
     async def simulate_assessment(
         self,
@@ -747,6 +807,25 @@ class AttentionEngineService:
             query = query.where(PriceSnapshot.observed_at >= watch_started_at)
         return session.scalar(query.order_by(PriceSnapshot.observed_at.desc()))
 
+    def _previous_price_snapshot(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_started_at: datetime,
+        before_observed_at: datetime,
+    ) -> PriceSnapshot | None:
+        return session.scalar(
+            select(PriceSnapshot)
+            .where(
+                PriceSnapshot.wallet_id == wallet_id,
+                PriceSnapshot.token_address == token_address,
+                PriceSnapshot.observed_at >= watch_started_at,
+                PriceSnapshot.observed_at < before_observed_at,
+            )
+            .order_by(PriceSnapshot.observed_at.desc())
+        )
+
     def _latest_token_snapshot(
         self,
         session,
@@ -1173,6 +1252,7 @@ class AttentionEngineService:
         price_change: Decimal | None,
         price_window: int | None,
         watch_started_at: datetime | None = None,
+        assessment_trigger: str | None = None,
     ) -> dict[str, Any]:
         cutoff = utc_now() - timedelta(minutes=self.settings.attention_event_aggregation_minutes)
         if watch_started_at is not None:
@@ -1190,6 +1270,7 @@ class AttentionEngineService:
         )
         dropped_out_top20 = self._dropped_out_top20_evidence(session, wallet_id, token_address)
         return {
+            "assessment_trigger": assessment_trigger,
             "family_scores": family_scores,
             "price_change_pct": str(price_change) if price_change is not None else None,
             "price_window_minutes": price_window,

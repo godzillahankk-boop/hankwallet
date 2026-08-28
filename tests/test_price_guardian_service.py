@@ -128,6 +128,19 @@ def make_failing_service(session_factory, app_settings, gmgn_client):
     return PriceGuardianService(session_factory, gmgn_client, app_settings, notify)
 
 
+def make_service_with_price_trigger(session_factory, app_settings, gmgn_client, sent, trigger):
+    async def notify(chat_id: int, text: str) -> None:
+        sent.append((chat_id, text))
+
+    return PriceGuardianService(
+        session_factory,
+        gmgn_client,
+        app_settings,
+        notify,
+        price_attention_trigger=trigger,
+    )
+
+
 def holding(
     *,
     token: str = TOKEN,
@@ -482,6 +495,61 @@ async def test_no_price_trading_position_keeps_watch_without_snapshot_or_attenti
         assert watch is not None
         assert watch.active is True
         assert list(session.scalars(select(PriceSnapshot))) == []
+
+
+@pytest.mark.asyncio
+async def test_price_attention_trigger_runs_after_snapshot_commit(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    gmgn = FakeGmgnClient({WALLET: [holding()]})
+    observed: list[int] = []
+
+    async def trigger(trigger_wallet_id: int, token_address: str) -> None:
+        with session_scope(session_factory) as session:
+            snapshots = list(
+                session.scalars(
+                    select(PriceSnapshot).where(
+                        PriceSnapshot.wallet_id == trigger_wallet_id,
+                        PriceSnapshot.token_address == token_address,
+                    )
+                )
+            )
+            observed.append(len(snapshots))
+
+    service = make_service_with_price_trigger(session_factory, app_settings, gmgn, sent, trigger)
+
+    result = await service.scan_wallet(wallet_id)
+
+    assert result.snapshots_saved == 1
+    assert observed == [1]
+
+
+@pytest.mark.asyncio
+async def test_price_attention_trigger_failure_does_not_drop_snapshot_or_stop_other_tokens(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    gmgn = FakeGmgnClient(
+        {
+            WALLET: [
+                holding(token=TOKEN, symbol="WINK"),
+                holding(token=TOKEN_2, symbol="PONS"),
+            ]
+        }
+    )
+    called: list[str] = []
+
+    async def trigger(trigger_wallet_id: int, token_address: str) -> None:
+        called.append(token_address)
+        if token_address == TOKEN:
+            raise RuntimeError("attention_trigger_down")
+
+    service = make_service_with_price_trigger(session_factory, app_settings, gmgn, sent, trigger)
+
+    result = await service.scan_wallet(wallet_id)
+
+    assert result.snapshots_saved == 2
+    assert result.errors == ["attention_trigger_down"]
+    assert called == sorted([TOKEN, TOKEN_2])
+    with session_scope(session_factory) as session:
+        assert len(list(session.scalars(select(PriceSnapshot)))) == 2
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ from app.utils.time import utc_now
 logger = logging.getLogger(__name__)
 
 Notifier = Callable[[int, str], Awaitable[None]]
+PriceAttentionTrigger = Callable[[int, str], Awaitable[object]]
 
 WINDOWS = (5, 15, 60)
 UP = "UP"
@@ -70,11 +71,13 @@ class PriceGuardianService:
         gmgn_client: GmgnClient,
         settings: Settings,
         notifier: Notifier | None = None,
+        price_attention_trigger: PriceAttentionTrigger | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gmgn_client = gmgn_client
         self.settings = settings
         self.notifier = notifier
+        self.price_attention_trigger = price_attention_trigger
         self._scan_lock = asyncio.Lock()
         self._wallet_semaphore = asyncio.Semaphore(max(settings.price_wallet_concurrency, 1))
 
@@ -142,6 +145,7 @@ class PriceGuardianService:
         result.holdings_found = len(holdings)
         now = utc_now()
         alerts: list[PriceAlert] = []
+        price_attention_tokens: set[tuple[int, str]] = set()
         with session_scope(self.session_factory) as session:
             wallet = session.scalar(
                 select(Wallet).where(Wallet.id == wallet_id, Wallet.is_active.is_(True))
@@ -174,6 +178,7 @@ class PriceGuardianService:
                 )
                 session.add(snapshot)
                 result.snapshots_saved += 1
+                price_attention_tokens.add((wallet.id, holding.contract_address))
                 candidate = self.classify_holding(holding)
                 if not candidate.monitored:
                     continue
@@ -192,6 +197,19 @@ class PriceGuardianService:
                 result.monitored_tokens,
                 result.snapshots_saved,
             )
+
+        if self.price_attention_trigger:
+            for trigger_wallet_id, token_address in sorted(price_attention_tokens):
+                try:
+                    await self.price_attention_trigger(trigger_wallet_id, token_address)
+                except Exception as exc:
+                    logger.warning(
+                        "Price Attention trigger failed wallet_id=%s token=%s: %s",
+                        trigger_wallet_id,
+                        token_address,
+                        exc,
+                    )
+                    result.errors.append(str(exc))
 
         if send_alerts and self.settings.price_guardian_alerts_enabled:
             for alert in alerts:
