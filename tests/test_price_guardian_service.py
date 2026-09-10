@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from datetime import timedelta
@@ -51,6 +52,33 @@ class FakeGmgnClient:
             raise RuntimeError("gmgn_down")
         wallet = query["wallet_address"]
         return [GmgnPage(items=self.holdings_by_wallet.get(wallet, []), next_cursor=None, raw={})]
+
+
+class ConcurrentGmgnClient:
+    def __init__(self, holdings_by_wallet: dict[str, list[dict]]) -> None:
+        self.holdings_by_wallet = holdings_by_wallet
+        self.calls = 0
+        self.active_total = 0
+        self.max_active_total = 0
+        self.active_by_wallet: dict[str, int] = {}
+        self.max_active_by_wallet: dict[str, int] = {}
+
+    async def get_wallet_holdings_pages(self, query: dict, *, max_pages: int = 1):
+        wallet = query["wallet_address"]
+        self.calls += 1
+        self.active_total += 1
+        self.max_active_total = max(self.max_active_total, self.active_total)
+        self.active_by_wallet[wallet] = self.active_by_wallet.get(wallet, 0) + 1
+        self.max_active_by_wallet[wallet] = max(
+            self.max_active_by_wallet.get(wallet, 0),
+            self.active_by_wallet[wallet],
+        )
+        try:
+            await asyncio.sleep(0.02)
+            return [GmgnPage(items=self.holdings_by_wallet.get(wallet, []), next_cursor=None, raw={})]
+        finally:
+            self.active_by_wallet[wallet] -= 1
+            self.active_total -= 1
 
 
 class FakeAttentionGmgn:
@@ -345,6 +373,81 @@ async def test_holding_auto_enters_monitor_and_new_holding_records_snapshot(serv
         watches = list(session.scalars(select(TokenWatchState)))
     assert len(watches) == 1
     assert watches[0].active is True
+
+
+@pytest.mark.asyncio
+async def test_scan_wallet_reports_canonical_trading_positions_without_extra_gmgn_fetch(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    gmgn = FakeGmgnClient(
+        {
+            WALLET: [
+                holding(symbol="ROBBIE"),
+                holding(token=TOKEN_2, symbol="WOOD", usd_value="4.50"),
+                holding(token="0x3333333333333333333333333333333333333333", symbol="UNKNOWN_VALUE", usd_value=None),
+                holding(token=USDG, symbol="USDG", usd_value="100"),
+                holding(token="0x2222222222222222222222222222222222222222", symbol="AIRDROP", buys=0, usd_value="40"),
+            ]
+        }
+    )
+    service = make_service(session_factory, app_settings, gmgn, sent)
+
+    result = await service.scan_wallet(wallet_id)
+
+    assert gmgn.calls == 1
+    assert result.holdings_found == 5
+    assert result.trading_positions_found == 3
+    assert result.display_positions == 1
+    assert result.below_threshold_positions == 1
+    assert result.position_symbols == ["ROBBIE"]
+    with session_scope(session_factory) as session:
+        watches = list(session.scalars(select(TokenWatchState).order_by(TokenWatchState.symbol.asc())))
+        snapshots = list(session.scalars(select(PriceSnapshot).order_by(PriceSnapshot.symbol.asc())))
+    assert [watch.symbol for watch in watches] == ["ROBBIE", "UNKNOWN_VALUE", "WOOD"]
+    assert [snapshot.symbol for snapshot in snapshots] == ["ROBBIE", "UNKNOWN_VALUE", "WOOD"]
+
+
+@pytest.mark.asyncio
+async def test_display_position_does_not_require_current_price(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    service = make_service(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(symbol="NOPRICE", price=None, usd_value="20")]}),
+        sent,
+    )
+
+    result = await service.scan_wallet(wallet_id)
+
+    assert result.trading_positions_found == 1
+    assert result.display_positions == 1
+    assert result.position_symbols == ["NOPRICE"]
+    assert result.monitored_tokens == 0
+    assert result.snapshots_saved == 0
+    assert count_snapshots(session_factory) == 0
+
+
+@pytest.mark.asyncio
+async def test_same_wallet_price_guardian_scans_share_wallet_lock(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    gmgn = ConcurrentGmgnClient({WALLET: [holding()]})
+    service = make_service(session_factory, app_settings, gmgn, sent)
+
+    await asyncio.gather(service.scan_wallet(wallet_id), service.scan_wallet(wallet_id))
+
+    assert gmgn.calls == 2
+    assert gmgn.max_active_by_wallet[WALLET] == 1
+
+
+@pytest.mark.asyncio
+async def test_different_wallet_price_guardian_scans_can_overlap(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, wallet_2_id = service_ctx
+    gmgn = ConcurrentGmgnClient({WALLET: [holding()], WALLET_2: [holding()]})
+    service = make_service(session_factory, app_settings, gmgn, sent)
+
+    await asyncio.gather(service.scan_wallet(wallet_id), service.scan_wallet(wallet_2_id))
+
+    assert gmgn.calls == 2
+    assert gmgn.max_active_total == 2
 
 
 def test_price_quality_jump_threshold_clamps_effective_price_threshold() -> None:
@@ -874,6 +977,24 @@ async def test_price_attention_trigger_runs_after_snapshot_commit(service_ctx) -
 
     assert result.snapshots_saved == 1
     assert observed == [1]
+
+
+@pytest.mark.asyncio
+async def test_scan_wallet_can_initialize_baseline_without_attention_trigger(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    gmgn = FakeGmgnClient({WALLET: [holding()]})
+    triggered: list[tuple[int, str]] = []
+
+    async def trigger(trigger_wallet_id: int, token_address: str) -> None:
+        triggered.append((trigger_wallet_id, token_address))
+
+    service = make_service_with_price_trigger(session_factory, app_settings, gmgn, sent, trigger)
+
+    result = await service.scan_wallet(wallet_id, send_alerts=False, trigger_attention=False)
+
+    assert result.snapshots_saved == 1
+    assert triggered == []
+    assert sent == []
 
 
 @pytest.mark.asyncio

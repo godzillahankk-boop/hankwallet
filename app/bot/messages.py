@@ -10,7 +10,12 @@ from app.bot.formatters import (
 )
 from app.db.models import Position, Wallet, WalletTokenBalance
 from app.services.gmgn_client import GmgnHolding
-from app.services.holding_classifier import is_trading_position
+from app.services.holding_classifier import (
+    is_below_threshold_position,
+    is_canonical_trading_position,
+    is_display_position,
+)
+from app.services.price_guardian_service import PriceGuardianResult
 from app.utils.address import short_address
 
 
@@ -81,16 +86,32 @@ def balances_message(balances: list[WalletTokenBalance]) -> str:
     return "\n".join(lines).strip()
 
 
-def gmgn_holdings_message(holdings: list[GmgnHolding], min_usd_value: Decimal) -> str:
-    trading_holdings = [holding for holding in holdings if is_trading_position(holding)]
+def gmgn_holdings_message(
+    holdings: list[GmgnHolding],
+    min_usd_value: Decimal,
+    excluded_symbols: tuple[str, ...] = (),
+) -> str:
+    trading_holdings = [
+        holding
+        for holding in holdings
+        if is_canonical_trading_position(holding, excluded_symbols)
+    ]
     if not trading_holdings:
         return NO_POSITIONS_MESSAGE
     display_holdings = [
         holding
         for holding in trading_holdings
-        if holding.usd_value is not None and holding.usd_value >= min_usd_value
+        if is_display_position(holding, min_usd_value, excluded_symbols)
     ]
-    lines = ["💼 当前持仓", f"（已隐藏金额<{format_threshold_usd(min_usd_value)}代币）", ""]
+    below_threshold_holdings = [
+        holding
+        for holding in trading_holdings
+        if is_below_threshold_position(holding, min_usd_value, excluded_symbols)
+    ]
+    lines = ["💼 当前持仓"]
+    if below_threshold_holdings:
+        lines.append(f"（已隐藏金额<{format_threshold_usd(min_usd_value)}代币）")
+    lines.append("")
     if not display_holdings:
         lines.append("当前没有达到关注金额的持仓。")
         return "\n".join(lines).strip()
@@ -124,6 +145,50 @@ def scan_done_message(created: int, updated: int, closed: int) -> str:
             f"清仓：{closed}",
         ]
     )
+
+
+def gmgn_scan_failure_message() -> str:
+    return "\n".join(
+        [
+            "⚠️ GMGN 持仓扫描失败",
+            "",
+            "钱包已经保存，稍后可以重新扫描。",
+        ]
+    )
+
+
+def gmgn_first_scan_done_message(result: PriceGuardianResult, min_usd_value: Decimal) -> str:
+    lines = [
+        "✅ 首次扫描完成",
+        "",
+        f"已识别当前持仓：{result.trading_positions_found}",
+        f"已加入监控：{result.trading_positions_found}",
+    ]
+    if result.below_threshold_positions:
+        lines.append(
+            f"已隐藏金额<{format_threshold_usd(min_usd_value)}持仓：{result.below_threshold_positions}"
+        )
+    if result.position_symbols:
+        lines.append("")
+        lines.extend(f"🟢 {symbol}" for symbol in result.position_symbols)
+    return "\n".join(lines)
+
+
+def gmgn_manual_scan_done_message(result: PriceGuardianResult, min_usd_value: Decimal) -> str:
+    lines = [
+        "🔄 扫描完成",
+        "",
+        f"当前持仓：{result.trading_positions_found}",
+        f"监控中：{result.trading_positions_found}",
+    ]
+    if result.below_threshold_positions:
+        lines.append(
+            f"隐藏<{format_threshold_usd(min_usd_value)}：{result.below_threshold_positions}"
+        )
+    if result.position_symbols:
+        lines.append("")
+        lines.extend(f"🟢 {symbol}" for symbol in result.position_symbols)
+    return "\n".join(lines)
 
 
 def format_amount(amount: Decimal) -> str:

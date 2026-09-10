@@ -35,8 +35,10 @@ from app.bot.messages import (
     balances_message,
     duplicate_wallet_message,
     gmgn_holdings_message,
+    gmgn_first_scan_done_message,
+    gmgn_manual_scan_done_message,
+    gmgn_scan_failure_message,
     invalid_wallet_message,
-    scan_done_message,
     wallet_added_message,
     wallet_list_message,
 )
@@ -48,7 +50,7 @@ from app.services.balance_service import BalanceService
 from app.services.daily_report_service import DailyReportService, format_daily_report
 from app.services.gmgn_client import GmgnHolding
 from app.services.monitoring_service import MonitoringService
-from app.services.price_guardian_service import PriceGuardianService
+from app.services.price_guardian_service import PriceGuardianResult, PriceGuardianService
 from app.services.wallet_service import WalletService
 
 logger = logging.getLogger(__name__)
@@ -154,13 +156,51 @@ async def add_wallet_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(
         wallet_added_message(wallet_address), reply_markup=main_menu_keyboard()
     )
-    monitoring_service: MonitoringService = context.application.bot_data[
-        "monitoring_service"
-    ]
     context.application.create_task(
-        monitoring_service.scan_wallet(wallet_id, reason="first_scan")
+        _run_gmgn_first_scan(context.application, wallet_id, update.effective_chat.id)
     )
     return ConversationHandler.END
+
+
+async def _run_gmgn_first_scan(application, wallet_id: int, chat_id: int) -> None:
+    settings: Settings = application.bot_data["settings"]
+    price_guardian_service: PriceGuardianService | None = application.bot_data.get(
+        "price_guardian_service"
+    )
+    if not price_guardian_service:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=gmgn_scan_failure_message(),
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    try:
+        result = await price_guardian_service.scan_wallet(
+            wallet_id,
+            send_alerts=False,
+            trigger_attention=False,
+        )
+    except Exception as exc:
+        logger.exception("GMGN first scan failed wallet_id=%s: %s", wallet_id, exc)
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=gmgn_scan_failure_message(),
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    if result.errors:
+        logger.warning("GMGN first scan returned errors wallet_id=%s errors=%s", wallet_id, result.errors)
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=gmgn_scan_failure_message(),
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    await application.bot.send_message(
+        chat_id=chat_id,
+        text=gmgn_first_scan_done_message(result, settings.price_monitor_min_usd_value),
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def list_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -236,7 +276,11 @@ async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if price_guardian_service and wallet_refs:
         try:
             holdings = await fetch_gmgn_position_holdings(wallet_refs, price_guardian_service)
-            text = gmgn_holdings_message(holdings, settings.price_monitor_min_usd_value)
+            text = gmgn_holdings_message(
+                holdings,
+                settings.price_monitor_min_usd_value,
+                settings.price_excluded_symbols,
+            )
             await update.message.reply_text(text, reply_markup=main_menu_keyboard())
             return
         except Exception as exc:
@@ -316,9 +360,15 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     last_by_user[update.effective_user.id] = now
 
     session_factory = context.application.bot_data["session_factory"]
-    monitoring_service: MonitoringService = context.application.bot_data[
-        "monitoring_service"
-    ]
+    price_guardian_service: PriceGuardianService | None = context.application.bot_data.get(
+        "price_guardian_service"
+    )
+    if not price_guardian_service:
+        await update.message.reply_text(
+            gmgn_scan_failure_message(),
+            reply_markup=main_menu_keyboard(),
+        )
+        return
     wallet_ids: list[int] = []
     with session_scope(session_factory) as session:
         user = session.scalar(
@@ -332,21 +382,31 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     )
                 )
             )
-    created = updated_count = closed = 0
+    total = PriceGuardianResult()
     for wallet_id in wallet_ids:
-        result = await monitoring_service.scan_wallet(wallet_id, reason="manual")
-        if result.error_message:
+        result = await price_guardian_service.scan_wallet(
+            wallet_id,
+            send_alerts=False,
+            trigger_attention=False,
+        )
+        if result.errors:
             await update.message.reply_text(
-                "\n".join(["⚠️ 钱包扫描失败", "", result.error_message]),
+                gmgn_scan_failure_message(),
                 reply_markup=main_menu_keyboard(),
             )
             return
-        created += result.positions_created
-        updated_count += result.positions_updated
-        closed += result.positions_closed
+        total.wallets_scanned += result.wallets_scanned
+        total.holdings_found += result.holdings_found
+        total.trading_positions_found += result.trading_positions_found
+        total.display_positions += result.display_positions
+        total.below_threshold_positions += result.below_threshold_positions
+        total.position_symbols.extend(result.position_symbols)
+        total.monitored_tokens += result.monitored_tokens
+        total.snapshots_saved += result.snapshots_saved
+        total.alerts_sent += result.alerts_sent
 
     await update.message.reply_text(
-        scan_done_message(created, updated_count, closed),
+        gmgn_manual_scan_done_message(total, settings.price_monitor_min_usd_value),
         reply_markup=main_menu_keyboard(),
     )
 

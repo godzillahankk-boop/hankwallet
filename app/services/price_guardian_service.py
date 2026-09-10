@@ -22,7 +22,12 @@ from app.db.models import (
 )
 from app.services import attention_scoring
 from app.services.gmgn_client import GmgnClient, GmgnHolding
-from app.services.holding_classifier import is_trading_position
+from app.services.holding_classifier import (
+    is_below_threshold_position,
+    is_canonical_trading_position,
+    is_display_position,
+    is_trading_position,
+)
 from app.services.price_quality import (
     PRICE_QUALITY_OUTLIER,
     PRICE_QUALITY_PENDING,
@@ -78,6 +83,10 @@ class PriceAlert:
 class PriceGuardianResult:
     wallets_scanned: int = 0
     holdings_found: int = 0
+    trading_positions_found: int = 0
+    display_positions: int = 0
+    below_threshold_positions: int = 0
+    position_symbols: list[str] = field(default_factory=list)
     monitored_tokens: int = 0
     snapshots_saved: int = 0
     alerts_sent: int = 0
@@ -108,6 +117,7 @@ class PriceGuardianService:
         self.price_attention_trigger = price_attention_trigger
         self._scan_lock = asyncio.Lock()
         self._wallet_semaphore = asyncio.Semaphore(max(settings.price_wallet_concurrency, 1))
+        self._wallet_locks: dict[int, asyncio.Lock] = {}
 
     async def scan_active_wallets(self) -> PriceGuardianResult:
         if self._scan_lock.locked():
@@ -127,6 +137,10 @@ class PriceGuardianService:
         for wallet_result in await asyncio.gather(*tasks):
             result.wallets_scanned += wallet_result.wallets_scanned
             result.holdings_found += wallet_result.holdings_found
+            result.trading_positions_found += wallet_result.trading_positions_found
+            result.display_positions += wallet_result.display_positions
+            result.below_threshold_positions += wallet_result.below_threshold_positions
+            result.position_symbols.extend(wallet_result.position_symbols)
             result.monitored_tokens += wallet_result.monitored_tokens
             result.snapshots_saved += wallet_result.snapshots_saved
             result.alerts_sent += wallet_result.alerts_sent
@@ -151,7 +165,28 @@ class PriceGuardianService:
                 logger.exception("Price Guardian wallet failed wallet_id=%s: %s", wallet_id, exc)
                 return PriceGuardianResult(errors=[str(exc)])
 
-    async def scan_wallet(self, wallet_id: int, *, send_alerts: bool = True) -> PriceGuardianResult:
+    async def scan_wallet(
+        self,
+        wallet_id: int,
+        *,
+        send_alerts: bool = True,
+        trigger_attention: bool = True,
+    ) -> PriceGuardianResult:
+        lock = self._wallet_locks.setdefault(wallet_id, asyncio.Lock())
+        async with lock:
+            return await self._scan_wallet_locked(
+                wallet_id,
+                send_alerts=send_alerts,
+                trigger_attention=trigger_attention,
+            )
+
+    async def _scan_wallet_locked(
+        self,
+        wallet_id: int,
+        *,
+        send_alerts: bool,
+        trigger_attention: bool,
+    ) -> PriceGuardianResult:
         result = PriceGuardianResult(wallets_scanned=1)
         with session_scope(self.session_factory) as session:
             wallet = session.scalar(
@@ -171,6 +206,28 @@ class PriceGuardianService:
             return result
 
         result.holdings_found = len(holdings)
+        for holding in holdings:
+            if not is_canonical_trading_position(
+                holding,
+                self.settings.price_excluded_symbols,
+            ):
+                continue
+            result.trading_positions_found += 1
+            if is_below_threshold_position(
+                holding,
+                self.settings.price_monitor_min_usd_value,
+                self.settings.price_excluded_symbols,
+            ):
+                result.below_threshold_positions += 1
+            if is_display_position(
+                holding,
+                self.settings.price_monitor_min_usd_value,
+                self.settings.price_excluded_symbols,
+            ):
+                result.display_positions += 1
+                result.position_symbols.append(
+                    holding.symbol or holding.contract_address or "UNKNOWN"
+                )
         now = utc_now()
         alerts: list[PriceAlert] = []
         price_attention_tokens: dict[tuple[int, str], bool] = {}
@@ -250,7 +307,7 @@ class PriceGuardianService:
                 result.snapshots_saved,
             )
 
-        if self.price_attention_trigger:
+        if trigger_attention and self.price_attention_trigger:
             for (trigger_wallet_id, token_address), confirmed_pending_crossing in sorted(price_attention_tokens.items()):
                 try:
                     if confirmed_pending_crossing:
@@ -344,13 +401,9 @@ class PriceGuardianService:
         return held
 
     def _is_watchable_trading_holding(self, holding: GmgnHolding) -> bool:
-        symbol = (holding.symbol or "").upper()
-        return (
-            holding.contract_address is not None
-            and holding.balance is not None
-            and holding.balance > 0
-            and symbol not in self.settings.price_excluded_symbols
-            and is_trading_position(holding)
+        return is_canonical_trading_position(
+            holding,
+            self.settings.price_excluded_symbols,
         )
 
     def _sync_watch_states(

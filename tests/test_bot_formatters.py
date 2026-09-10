@@ -97,13 +97,23 @@ def test_gmgn_holdings_message_hides_no_buy_airdrop() -> None:
     assert text == "当前没有检测到正在监控的持仓。"
 
 
+def test_gmgn_holdings_message_excludes_quote_assets() -> None:
+    text = gmgn_holdings_message(
+        [gmgn_holding(symbol="USDG"), gmgn_holding(symbol="ROBBIE")],
+        Decimal("5"),
+        ("USDG", "USDC", "USDT", "ETH", "WETH"),
+    )
+
+    assert "🟢 ROBBIE" in text
+    assert "🟢 USDG" not in text
+
+
 def test_gmgn_holdings_message_shows_buy_position_with_unrealized_pnl() -> None:
     text = gmgn_holdings_message([gmgn_holding()], Decimal("5"))
 
     assert text == "\n".join(
         [
             "💼 当前持仓",
-            "（已隐藏金额<$5代币）",
             "",
             "🟢 PONS",
             "数量：164.3",
@@ -143,12 +153,30 @@ def test_gmgn_holdings_message_min_value_boundary() -> None:
     assert "🟢 AT" in text
     assert "🟢 BELOW" not in text
     assert "🟢 UNKNOWN" not in text
+    assert "（已隐藏金额<$5代币）" in text
 
 
 def test_gmgn_holdings_message_threshold_title_uses_config_value() -> None:
-    text = gmgn_holdings_message([gmgn_holding(usd_value="12")], Decimal("10"))
+    text = gmgn_holdings_message(
+        [gmgn_holding(usd_value="12"), gmgn_holding(symbol="LOW", usd_value="9.99")],
+        Decimal("10"),
+    )
 
     assert "（已隐藏金额<$10代币）" in text
+
+
+def test_gmgn_holdings_message_unknown_usd_value_is_not_hidden_below_threshold() -> None:
+    text = gmgn_holdings_message([gmgn_holding(usd_value=None)], Decimal("5"))
+
+    assert "隐藏金额<$5" not in text
+    assert text == "\n".join(["💼 当前持仓", "", "当前没有达到关注金额的持仓。"])
+
+
+def test_gmgn_holdings_message_displays_without_current_price_when_usd_value_is_enough() -> None:
+    text = gmgn_holdings_message([gmgn_holding(symbol="NOPRICE", usd_value="20")], Decimal("5"))
+
+    assert "🟢 NOPRICE" in text
+    assert "金额：$20.0" in text
 
 
 def test_gmgn_holdings_message_all_trading_positions_below_threshold() -> None:
