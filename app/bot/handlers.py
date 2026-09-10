@@ -18,6 +18,7 @@ from telegram.ext import (
 from app.bot.keyboards import (
     BTN_ADD_WALLET,
     BTN_BACK,
+    BTN_DAILY_REPORT,
     BTN_DELETE_WALLET,
     BTN_LIST_WALLETS,
     BTN_POSITIONS,
@@ -44,6 +45,7 @@ from app.db.database import session_scope
 from app.db.models import User, Wallet
 from app.services.attention_engine_service import AttentionEngineService, format_attention_debug
 from app.services.balance_service import BalanceService
+from app.services.daily_report_service import DailyReportService, format_daily_report
 from app.services.gmgn_client import GmgnHolding
 from app.services.monitoring_service import MonitoringService
 from app.services.price_guardian_service import PriceGuardianService
@@ -93,6 +95,7 @@ def build_application(
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_WALLETS}$"), list_wallets))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_POSITIONS}$"), list_positions))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_SCAN}$"), manual_scan))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_DAILY_REPORT}$"), daily_report))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_SETTINGS}$"), settings_message))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_BACK}$"), back_to_main))
     application.add_error_handler(error_handler)
@@ -346,6 +349,20 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         scan_done_message(created, updated_count, closed),
         reply_markup=main_menu_keyboard(),
     )
+
+
+async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    settings: Settings = context.application.bot_data["settings"]
+    session_factory = context.application.bot_data["session_factory"]
+    service = DailyReportService(
+        session_factory,
+        report_timezone=settings.report_timezone,
+        price_tolerance_minutes=settings.daily_report_price_tolerance_minutes,
+    )
+    report = service.build_yesterday_report_for_telegram_user(update.effective_user.id)
+    await update.message.reply_text(format_daily_report(report), reply_markup=main_menu_keyboard())
 
 
 async def settings_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

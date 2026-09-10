@@ -60,6 +60,37 @@ class Settings:
     attention_top_holder_due_seconds: int = 900
     attention_top_holder_dispatch_seconds: int = 60
     price_guardian_alerts_enabled: bool = False
+    twitterapi_io_api_key: str | None = None
+    social_x_enabled: bool = False
+    social_x_provider: str = "twitterapi_io"
+    social_x_rule_refresh_seconds: int = 300
+    social_x_filter_interval_seconds: int = 300
+    social_x_rule_min_update_interval_seconds: int = 1800
+    social_x_rule_max_value_chars: int = 240
+    social_x_rule_shard_state_path: str = "data/twitter_social_rule_shards.json"
+    social_x_warmup_grace_seconds: int = 120
+    social_x_kol_config_path: str = "config/social_kols.json"
+    social_x_websocket_url: str = "wss://ws.twitterapi.io/twitter/tweet/websocket"
+    social_kol_auto_verify_enabled: bool = False
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
+    social_kol_verify_model: str = "deepseek-chat"
+    social_kol_verify_max_concurrency: int = 3
+    social_x_discovery_enabled: bool = False
+    social_x_discovery_due_seconds: int = 900
+    social_x_discovery_max_due_seconds: int = 14400
+    social_x_discovery_bootstrap_lookback_seconds: int = 900
+    social_x_discovery_dispatch_seconds: int = 60
+    social_x_discovery_batch_size: int = 3
+    social_x_discovery_max_pages: int = 1
+    social_x_discovery_overlap_seconds: int = 120
+    social_x_discovery_cashtag_enabled: bool = False
+    social_kol_verify_batch_size: int = 20
+    social_shadow_report_seconds: int = 300
+    social_memory_enabled: bool = False
+    social_memory_triage_model: str = "deepseek-chat"
+    report_timezone: str = "Asia/Shanghai"
+    daily_report_price_tolerance_minutes: int = 90
 
 
 def _get_int(name: str, default: int) -> int:
@@ -152,4 +183,44 @@ def load_settings() -> Settings:
         ),
         attention_top_holder_dispatch_seconds=_get_int("ATTENTION_TOP_HOLDER_DISPATCH_SECONDS", 60),
         price_guardian_alerts_enabled=_get_bool("PRICE_GUARDIAN_ALERTS_ENABLED", False),
+        twitterapi_io_api_key=os.getenv("TWITTERAPI_IO_API_KEY") or None,
+        social_x_enabled=_get_bool("SOCIAL_X_ENABLED", False),
+        social_x_provider=os.getenv("SOCIAL_X_PROVIDER", "twitterapi_io"),
+        social_x_rule_refresh_seconds=_get_int("SOCIAL_X_RULE_REFRESH_SECONDS", 300),
+        social_x_filter_interval_seconds=max(60, _get_int("SOCIAL_X_FILTER_INTERVAL_SECONDS", 300)),
+        social_x_rule_min_update_interval_seconds=_get_int("SOCIAL_X_RULE_MIN_UPDATE_INTERVAL_SECONDS", 1800),
+        social_x_rule_max_value_chars=_get_int("SOCIAL_X_RULE_MAX_VALUE_CHARS", 240),
+        social_x_rule_shard_state_path=os.getenv(
+            "SOCIAL_X_RULE_SHARD_STATE_PATH",
+            "data/twitter_social_rule_shards.json",
+        ),
+        social_x_warmup_grace_seconds=_get_int("SOCIAL_X_WARMUP_GRACE_SECONDS", 120),
+        social_x_kol_config_path=os.getenv("SOCIAL_X_KOL_CONFIG_PATH", "config/social_kols.json"),
+        social_x_websocket_url=os.getenv(
+            "SOCIAL_X_WEBSOCKET_URL",
+            "wss://ws.twitterapi.io/twitter/tweet/websocket",
+        ),
+        social_kol_auto_verify_enabled=_get_bool("SOCIAL_KOL_AUTO_VERIFY_ENABLED", False),
+        deepseek_api_key=os.getenv("DEEPSEEK_API_KEY") or None,
+        deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        social_kol_verify_model=os.getenv("SOCIAL_KOL_VERIFY_MODEL", "deepseek-chat"),
+        social_kol_verify_max_concurrency=_get_int("SOCIAL_KOL_VERIFY_MAX_CONCURRENCY", 3),
+        social_x_discovery_enabled=_get_bool("SOCIAL_X_DISCOVERY_ENABLED", False),
+        social_x_discovery_due_seconds=_get_int("SOCIAL_X_DISCOVERY_DUE_SECONDS", 900),
+        social_x_discovery_max_due_seconds=_get_int("SOCIAL_X_DISCOVERY_MAX_DUE_SECONDS", 14400),
+        social_x_discovery_bootstrap_lookback_seconds=_get_int(
+            "SOCIAL_X_DISCOVERY_BOOTSTRAP_LOOKBACK_SECONDS",
+            900,
+        ),
+        social_x_discovery_dispatch_seconds=_get_int("SOCIAL_X_DISCOVERY_DISPATCH_SECONDS", 60),
+        social_x_discovery_batch_size=_get_int("SOCIAL_X_DISCOVERY_BATCH_SIZE", 3),
+        social_x_discovery_max_pages=_get_int("SOCIAL_X_DISCOVERY_MAX_PAGES", 1),
+        social_x_discovery_overlap_seconds=_get_int("SOCIAL_X_DISCOVERY_OVERLAP_SECONDS", 120),
+        social_x_discovery_cashtag_enabled=_get_bool("SOCIAL_X_DISCOVERY_CASHTAG_ENABLED", False),
+        social_kol_verify_batch_size=_get_int("SOCIAL_KOL_VERIFY_BATCH_SIZE", 20),
+        social_shadow_report_seconds=_get_int("SOCIAL_SHADOW_REPORT_SECONDS", 300),
+        social_memory_enabled=_get_bool("SOCIAL_MEMORY_ENABLED", False),
+        social_memory_triage_model=os.getenv("SOCIAL_MEMORY_TRIAGE_MODEL", "deepseek-chat"),
+        report_timezone=os.getenv("REPORT_TIMEZONE", "Asia/Shanghai"),
+        daily_report_price_tolerance_minutes=_get_int("DAILY_REPORT_PRICE_TOLERANCE_MINUTES", 90),
     )

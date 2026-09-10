@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -17,7 +18,12 @@ from app.core.config import load_settings
 from app.db.database import make_engine, make_session_factory, session_scope
 from app.db.models import TokenWatchState, Wallet
 from app.services import attention_scoring as scoring
-from app.services.attention_engine_service import AttentionEngineService, format_attention_alert
+from app.services.attention_engine_service import (
+    AttentionEngineService,
+    build_attention_copy_markup,
+    build_position_intelligence,
+    format_attention_alert,
+)
 from app.services.gmgn_client import GmgnClient
 from app.utils.address import is_valid_evm_address, normalize_evm_address
 
@@ -46,11 +52,74 @@ async def main() -> None:
             usd_value=Decimal(str(args.usd_value)),
             direction=args.direction,
         )
+        display_facts = {
+            "price": {
+                "window_minutes": 5,
+                "change_pct": "32.6",
+                "current_price": "0.000013",
+                "baseline_price": "0.0000098",
+            },
+            "holder_count": {
+                "window_minutes": 30,
+                "baseline_count": 500,
+                "current_count": 542,
+                "delta_count": 42,
+                "change_pct": "8.4",
+            },
+            "top10": {
+                "window_minutes": 15,
+                "baseline_share": "0.420",
+                "current_share": "0.508",
+                "change_pct": "21",
+            },
+            "smart_money": {
+                "window_minutes": 15,
+                "buy_wallets": 2,
+                "sell_wallets": 6,
+                "net_wallets": -4,
+                "buy_usd": "1000",
+                "sell_usd": "8200",
+                "net_usd": "-7200",
+                "usd_complete": True,
+            },
+            "kol": {
+                "window_minutes": 15,
+                "buy_wallets": 2,
+                "sell_wallets": 1,
+                "net_wallets": 1,
+                "buy_usd": "1200",
+                "sell_usd": "300",
+                "net_usd": "900",
+                "usd_complete": True,
+            },
+            "liquidity": {
+                "window_minutes": 60,
+                "baseline_usd": "100000",
+                "current_usd": "96800",
+                "change_pct": "-3.2",
+            },
+        }
+        scores = {
+            "price_score": assessment.price_score,
+            "holder_breadth_score": assessment.holder_breadth_score,
+            "holder_family_score": assessment.holder_family_score,
+            "smart_money_score": assessment.smart_money_score,
+            "kol_score": assessment.kol_score,
+            "liquidity_score": assessment.liquidity_score,
+        }
+        assessment.evidence_json = json.dumps(
+            {
+                "simulate": True,
+                "display_facts": display_facts,
+                "position_intelligence": build_position_intelligence(scores, display_facts).to_dict(),
+                },
+            ensure_ascii=False,
+        )
         text = "\n".join(["🧪 Attention Engine 测试提醒", "", format_attention_alert(assessment)])
         print(text)
         if args.send_telegram:
             bot = Bot(settings.telegram_bot_token)
-            await bot.send_message(chat_id=chat_id, text=text)
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=build_attention_copy_markup(assessment))
             print()
             print("Telegram test alert sent.")
     finally:

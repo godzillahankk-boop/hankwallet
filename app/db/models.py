@@ -175,6 +175,11 @@ class PriceSnapshot(Base):
     balance: Mapped[float] = mapped_column(Numeric(38, 18), nullable=False)
     usd_value: Mapped[Optional[float]] = mapped_column(Numeric(24, 8), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    quality_status: Mapped[str] = mapped_column(String(16), default="VALID", nullable=False)
+    quality_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    source_provider: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    source_endpoint: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    source_field: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
 
 class PriceAlertState(Base):
@@ -359,3 +364,182 @@ class AttentionAlertState(Base):
     last_direction: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     family_scores_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class SocialIdentity(Base):
+    __tablename__ = "social_identities"
+    __table_args__ = (
+        UniqueConstraint("chain", "token_address", "identity_type", "normalized_value"),
+        Index("ix_social_identities_token_type_active", "chain", "token_address", "identity_type", "is_active"),
+        Index("ix_social_identities_token", "chain", "token_address"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    identity_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    value: Mapped[str] = mapped_column(String(512), nullable=False)
+    normalized_value: Mapped[str] = mapped_column(String(512), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_field: Mapped[str] = mapped_column(String(128), nullable=False)
+    confidence: Mapped[str] = mapped_column(String(16), nullable=False)
+    evidence_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_verified_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    valid_from: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    valid_to: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class SocialEvent(Base):
+    __tablename__ = "social_events"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", "token_address", "watch_state_id"),
+        Index("ix_social_events_provider_event", "provider", "provider_event_id"),
+        Index("ix_social_events_wallet_token_posted", "wallet_id", "token_address", "posted_at"),
+        Index("ix_social_events_watch_posted", "watch_state_id", "posted_at"),
+        Index("ix_social_events_author_posted", "author_id", "posted_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), nullable=False)
+    watch_state_id: Mapped[int] = mapped_column(ForeignKey("token_watch_states.id"), nullable=False)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    author_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    author_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    author_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    posted_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ingestion_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    post_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    match_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    matched_value: Mapped[str] = mapped_column(String(512), nullable=False)
+    tweet_url: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    like_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    retweet_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    reply_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    quote_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    view_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    rule_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    rule_tag: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class KOLTokenFirstMention(Base):
+    __tablename__ = "kol_token_first_mentions"
+    __table_args__ = (
+        UniqueConstraint("chain", "token_address", "author_key"),
+        Index("ix_kol_first_mentions_token_author", "chain", "token_address", "author_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    author_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    author_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    author_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    first_mention_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    first_tweet_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    first_match_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    observation_scope: Mapped[str] = mapped_column(String(32), default="wallet_agent_observed", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class SocialKOLProfile(Base):
+    __tablename__ = "social_kol_profiles"
+    __table_args__ = (
+        UniqueConstraint("normalized_username"),
+        Index("ix_social_kol_profiles_author_id", "x_author_id"),
+        Index("ix_social_kol_profiles_username", "normalized_username"),
+        Index("ix_social_kol_profiles_status", "status"),
+        Index("ix_social_kol_profiles_recheck_after", "recheck_after"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    x_author_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, unique=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    normalized_username: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    follower_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    crypto_relevant: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    confidence: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    sources_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verification_method: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    verification_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sample_tweet_ids_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    recheck_after: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    manual_override: Mapped[str] = mapped_column(String(16), default="none", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class SocialDiscoveryCursor(Base):
+    __tablename__ = "social_discovery_cursors"
+    __table_args__ = (
+        UniqueConstraint("watch_state_id", "query_kind"),
+        Index("ix_social_discovery_cursors_next_due", "next_due_at"),
+        Index("ix_social_discovery_cursors_wallet_token", "wallet_id", "token_address"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    watch_state_id: Mapped[int] = mapped_column(ForeignKey("token_watch_states.id"), nullable=False)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), nullable=False)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    latest_seen_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    next_due_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    consecutive_no_new_author_runs: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    api_calls: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class SocialMemory(Base):
+    __tablename__ = "social_memories"
+    __table_args__ = (
+        UniqueConstraint("provider", "tweet_id", "chain", "token_address"),
+        Index("ix_social_memories_token_event_time", "chain", "token_address", "event_time"),
+        Index("ix_social_memories_category", "category"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    project_identity: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    project_key: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    source_author_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    source_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    source_author_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    tweet_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tweet_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    significance: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[str] = mapped_column(String(16), nullable=False)
+    information_scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    raw_reference_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    triage_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

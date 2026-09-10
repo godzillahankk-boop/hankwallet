@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
@@ -9,13 +10,23 @@ from sqlalchemy import select
 
 from app.core.config import Settings
 from app.db.database import init_db, make_engine, make_session_factory, session_scope
-from app.db.models import AttentionAlertState, PriceAlertState, PriceSnapshot, TokenWatchState
+from app.db.models import AttentionAlertState, AttentionAssessment, PriceAlertState, PriceSnapshot, TokenWatchState
+from app.services.attention_engine_service import AttentionEngineService
 from app.services.gmgn_client import GmgnPage, parse_holding
 from app.services.price_guardian_service import (
     DOWN,
     UP,
     PriceGuardianService,
     format_price,
+)
+from app.services.price_quality import (
+    PRICE_QUALITY_OUTLIER,
+    PRICE_QUALITY_PENDING,
+    PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT,
+    PRICE_QUALITY_REASON_REVERTED_NEXT_SNAPSHOT,
+    PRICE_QUALITY_REASON_SINGLE_SNAPSHOT_JUMP,
+    PRICE_QUALITY_VALID,
+    price_quality_jump_threshold,
 )
 from app.services.wallet_service import WalletService
 from app.utils.time import utc_now
@@ -40,6 +51,10 @@ class FakeGmgnClient:
             raise RuntimeError("gmgn_down")
         wallet = query["wallet_address"]
         return [GmgnPage(items=self.holdings_by_wallet.get(wallet, []), next_cursor=None, raw={})]
+
+
+class FakeAttentionGmgn:
+    pass
 
 
 @pytest.fixture
@@ -293,6 +308,28 @@ def count_snapshots(session_factory, token: str = TOKEN) -> int:
         )
 
 
+def price_snapshots(session_factory, token: str = TOKEN) -> list[PriceSnapshot]:
+    with session_scope(session_factory) as session:
+        return list(
+            session.scalars(
+                select(PriceSnapshot)
+                .where(PriceSnapshot.token_address == token)
+                .order_by(PriceSnapshot.observed_at.asc(), PriceSnapshot.id.asc())
+            )
+        )
+
+
+def attention_assessments(session_factory, token: str = TOKEN) -> list[AttentionAssessment]:
+    with session_scope(session_factory) as session:
+        return list(
+            session.scalars(
+                select(AttentionAssessment)
+                .where(AttentionAssessment.token_address == token)
+                .order_by(AttentionAssessment.assessed_at.asc(), AttentionAssessment.id.asc())
+            )
+        )
+
+
 @pytest.mark.asyncio
 async def test_holding_auto_enters_monitor_and_new_holding_records_snapshot(service_ctx) -> None:
     app_settings, session_factory, sent, wallet_id, _ = service_ctx
@@ -308,6 +345,322 @@ async def test_holding_auto_enters_monitor_and_new_holding_records_snapshot(serv
         watches = list(session.scalars(select(TokenWatchState)))
     assert len(watches) == 1
     assert watches[0].active is True
+
+
+def test_price_quality_jump_threshold_clamps_effective_price_threshold() -> None:
+    assert price_quality_jump_threshold(Decimal("5")) == Decimal("20")
+    assert price_quality_jump_threshold(Decimal("15")) == Decimal("30")
+    assert price_quality_jump_threshold(Decimal("30")) == Decimal("40")
+
+
+@pytest.mark.asyncio
+async def test_suspicious_single_step_price_jump_is_pending_and_does_not_trigger_attention(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    triggered: list[tuple[int, str]] = []
+
+    async def trigger(trigger_wallet_id: int, token_address: str) -> None:
+        triggered.append((trigger_wallet_id, token_address))
+
+    gmgn = FakeGmgnClient({WALLET: [holding(price="0.230", usd_value="23")]})
+    service = make_service_with_price_trigger(session_factory, app_settings, gmgn, sent, trigger)
+    await service.scan_wallet(wallet_id)
+    triggered.clear()
+
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.435", usd_value="43.5")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_PENDING,
+    ]
+    assert snapshots[-1].quality_reason == PRICE_QUALITY_REASON_SINGLE_SNAPSHOT_JUMP
+    assert triggered == []
+
+
+@pytest.mark.asyncio
+async def test_ai_bad_price_replay_marks_single_snapshot_outlier_and_avoids_reverse_fake_trigger(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    triggered: list[tuple[int, str]] = []
+
+    async def trigger(trigger_wallet_id: int, token_address: str) -> None:
+        triggered.append((trigger_wallet_id, token_address))
+
+    service = make_service_with_price_trigger(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="0.23056119", usd_value="37.61")]}),
+        sent,
+        trigger,
+    )
+    await service.scan_wallet(wallet_id)
+    triggered.clear()
+
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.43582597", usd_value="71.08")]})
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.23464219", usd_value="38.27")]})
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.23484438", usd_value="38.30")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_OUTLIER,
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+    ]
+    assert snapshots[1].quality_reason == PRICE_QUALITY_REASON_REVERTED_NEXT_SNAPSHOT
+    assert len(triggered) == 2
+    assert all(token == TOKEN for _, token in triggered)
+
+
+@pytest.mark.asyncio
+async def test_suspicious_price_jump_confirmed_by_next_snapshot_becomes_valid(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    triggered: list[tuple[int, str]] = []
+
+    async def trigger(trigger_wallet_id: int, token_address: str) -> None:
+        triggered.append((trigger_wallet_id, token_address))
+
+    service = make_service_with_price_trigger(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="0.230", usd_value="23")]}),
+        sent,
+        trigger,
+    )
+    await service.scan_wallet(wallet_id)
+    triggered.clear()
+
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.435", usd_value="43.5")]})
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.440", usd_value="44")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+    ]
+    assert snapshots[1].quality_reason == PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT
+    assert snapshots[2].quality_reason == PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT
+    assert triggered == [(wallet_id, TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_pending_below_five_preserves_usd_threshold_crossing(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    attention = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings)
+    service = make_service_with_price_trigger(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="1.00", usd_value="6")]}),
+        sent,
+        attention.handle_price_snapshot_update,
+    )
+    await service.scan_wallet(wallet_id)
+
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.40", usd_value="2.4")]})
+    await service.scan_wallet(wallet_id)
+    assert attention_assessments(session_factory) == []
+
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.41", usd_value="2.46")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assessments = attention_assessments(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+    ]
+    assert snapshots[1].quality_reason == PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT
+    assert len(assessments) == 1
+    evidence = json.loads(assessments[0].evidence_json)
+    assert evidence["assessment_trigger"] == "usd_threshold_crossing"
+    assert assessments[0].position_exposure_score == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_reverts_to_above_min_does_not_create_crossing_assessment(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    attention = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings)
+    service = make_service_with_price_trigger(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="1.00", usd_value="6")]}),
+        sent,
+        attention.handle_price_snapshot_update,
+    )
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.40", usd_value="2.4")]})
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="1.02", usd_value="6.1")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_OUTLIER,
+        PRICE_QUALITY_VALID,
+    ]
+    assert attention_assessments(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_pending_when_already_below_five_does_not_create_crossing_assessment(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    attention = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings)
+    service = make_service_with_price_trigger(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="1.00", usd_value="3")]}),
+        sent,
+        attention.handle_price_snapshot_update,
+    )
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.40", usd_value="1.2")]})
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.41", usd_value="1.23")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+    ]
+    assert snapshots[1].quality_reason == PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT
+    assert attention_assessments(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_pending_crossing_does_not_use_previous_watch_session(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    attention = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings)
+    service = make_service_with_price_trigger(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="1.00", usd_value="6")]}),
+        sent,
+        attention.handle_price_snapshot_update,
+    )
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.40", usd_value="2.4")]})
+    await service.scan_wallet(wallet_id)
+    with session_scope(session_factory) as session:
+        watch = session.scalar(
+            select(TokenWatchState).where(
+                TokenWatchState.wallet_id == wallet_id,
+                TokenWatchState.token_address == TOKEN,
+                TokenWatchState.active.is_(True),
+            )
+        )
+        assert watch is not None
+        watch.active = False
+        watch.ended_at = utc_now()
+
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.41", usd_value="2.46")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_PENDING,
+        PRICE_QUALITY_VALID,
+    ]
+    assert attention_assessments(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_pending_rise_above_five_does_not_emit_crossing_flag(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    trigger_kwargs: list[dict] = []
+
+    async def trigger(trigger_wallet_id: int, token_address: str, **kwargs) -> None:
+        trigger_kwargs.append(kwargs)
+
+    service = make_service_with_price_trigger(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="1.00", usd_value="3")]}),
+        sent,
+        trigger,
+    )
+    await service.scan_wallet(wallet_id)
+    trigger_kwargs.clear()
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="2.70", usd_value="8")]})
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="2.75", usd_value="8.2")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+    ]
+    assert trigger_kwargs == [{}]
+
+
+@pytest.mark.asyncio
+async def test_normal_price_move_stays_valid_and_source_metadata_is_saved(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    service = make_service(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="0.230", usd_value="23")]}),
+        sent,
+    )
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.240", usd_value="24")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_VALID,
+    ]
+    assert snapshots[-1].source_provider == "gmgn"
+    assert snapshots[-1].source_endpoint == "/v1/user/wallet_holdings"
+    assert snapshots[-1].source_field == "token.price"
+
+
+@pytest.mark.asyncio
+async def test_new_watch_session_does_not_confirm_old_pending_snapshot(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    service = make_service(
+        session_factory,
+        app_settings,
+        FakeGmgnClient({WALLET: [holding(price="0.230", usd_value="23")]}),
+        sent,
+    )
+    await service.scan_wallet(wallet_id)
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.435", usd_value="43.5")]})
+    await service.scan_wallet(wallet_id)
+    with session_scope(session_factory) as session:
+        watch = session.scalar(
+            select(TokenWatchState).where(
+                TokenWatchState.wallet_id == wallet_id,
+                TokenWatchState.token_address == TOKEN,
+                TokenWatchState.active.is_(True),
+            )
+        )
+        assert watch is not None
+        watch.active = False
+        watch.ended_at = utc_now()
+
+    service.gmgn_client = FakeGmgnClient({WALLET: [holding(price="0.440", usd_value="44")]})
+    await service.scan_wallet(wallet_id)
+
+    snapshots = price_snapshots(session_factory)
+    assert [snapshot.quality_status for snapshot in snapshots] == [
+        PRICE_QUALITY_VALID,
+        PRICE_QUALITY_PENDING,
+        PRICE_QUALITY_VALID,
+    ]
 
 
 @pytest.mark.asyncio
@@ -719,6 +1072,12 @@ async def test_telegram_failure_does_not_mark_success_and_allows_retry(service_c
 @pytest.mark.asyncio
 async def test_multi_window_single_message_and_independent_token_messages(service_ctx) -> None:
     app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    app_settings = replace(
+        app_settings,
+        price_alert_5m_percent=Decimal("5"),
+        price_alert_15m_percent=Decimal("7"),
+        price_alert_60m_percent=Decimal("9"),
+    )
     for minutes in (5, 15, 60):
         add_baseline(session_factory, wallet_id, TOKEN, "100", minutes)
     add_baseline(session_factory, wallet_id, TOKEN_2, "100", 5, "PONS")
@@ -728,7 +1087,7 @@ async def test_multi_window_single_message_and_independent_token_messages(servic
         FakeGmgnClient(
             {
                 WALLET: [
-                    holding(price="135"),
+                    holding(price="119"),
                     holding(token=TOKEN_2, symbol="PONS", price="112", usd_value="20"),
                 ]
             }

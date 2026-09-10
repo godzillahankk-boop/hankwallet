@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 from collections import defaultdict
@@ -11,8 +12,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import sessionmaker
+from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.core.config import Settings
 from app.db.database import session_scope
@@ -35,11 +37,13 @@ from app.services.gmgn_client import (
     GmgnTokenOverview,
     GmgnTrackTrade,
 )
+from app.services.price_quality import PRICE_QUALITY_VALID
+from app.services.social_identity_service import SocialIdentityService
 from app.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
 
-Notifier = Callable[[int, str], Awaitable[None]]
+Notifier = Callable[..., Awaitable[None]]
 
 MARKET_SIGNAL_GROUPS = [
     {"signal_type": [6, 7]},
@@ -48,6 +52,26 @@ MARKET_SIGNAL_GROUPS = [
 ]
 
 ATTENTION_NOTIFICATION_RETRY_DELAYS_SECONDS = (0, 1, 2)
+HOLDER_COUNT_WINDOW_MINUTES = 30
+LIQUIDITY_WINDOW_MINUTES = 60
+TOP10_DISPLAY_MIN_ABS_CHANGE_PCT = Decimal("10")
+TOP10_DISPLAY_MAX_WINDOW_MINUTES = 60
+
+MARKET_EXPANSION = "market_expansion"
+MINORITY_DRIVEN = "minority_driven"
+STRUCTURAL_DETERIORATION = "structural_deterioration"
+SUPPORT_EMERGING = "support_emerging"
+SIGNAL_DIVERGENCE = "signal_divergence"
+NO_CLEAR_CHANGE = "no_clear_change"
+
+POSITION_LABELS_CN = {
+    MARKET_EXPANSION: "市场扩散增强",
+    MINORITY_DRIVEN: "少数资金推动",
+    STRUCTURAL_DETERIORATION: "结构性恶化",
+    SUPPORT_EMERGING: "出现承接",
+    SIGNAL_DIVERGENCE: "信号分化",
+    NO_CLEAR_CHANGE: "暂无明显结构变化",
+}
 
 
 @dataclass(frozen=True)
@@ -75,6 +99,73 @@ class AttentionRunResult:
         self.errors.append(str(error))
 
 
+@dataclass(frozen=True)
+class HolderCountFact:
+    score: int
+    direction: str
+    window_minutes: int
+    baseline_count: int
+    current_count: int
+    delta_count: int
+    change_pct: Decimal
+
+
+@dataclass(frozen=True)
+class FeedFamilyFact:
+    family: str
+    score: int
+    direction: str
+    window_minutes: int
+    buy_wallets: int
+    sell_wallets: int
+    net_directional_wallets: int
+    buy_usd: Decimal | None
+    sell_usd: Decimal | None
+    net_usd: Decimal | None
+    usd_complete: bool
+    buy_activity_count: int
+    sell_activity_count: int
+
+
+@dataclass(frozen=True)
+class LiquidityFact:
+    score: int
+    direction: str
+    window_minutes: int
+    baseline_usd: Decimal
+    current_usd: Decimal
+    change_pct: Decimal
+
+
+@dataclass(frozen=True)
+class StructureSignal:
+    family: str
+    direction: str
+    strength: int
+    value: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class PositionIntelligenceResult:
+    label: str
+    label_cn: str
+    summary: str
+    positive_drivers: list[str]
+    negative_drivers: list[str]
+    neutral_drivers: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "label_cn": self.label_cn,
+            "summary": self.summary,
+            "positive_drivers": self.positive_drivers,
+            "negative_drivers": self.negative_drivers,
+            "neutral_drivers": self.neutral_drivers,
+        }
+
+
 class AttentionEngineService:
     def __init__(
         self,
@@ -82,11 +173,14 @@ class AttentionEngineService:
         gmgn_client: GmgnClient,
         settings: Settings,
         notifier: Notifier | None = None,
+        social_identity_service: SocialIdentityService | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gmgn_client = gmgn_client
         self.settings = settings
         self.notifier = notifier
+        self.social_identity_service = social_identity_service or SocialIdentityService(session_factory)
+        self._notification_locks: dict[tuple[int, str], asyncio.Lock] = {}
 
     async def scan_smart_money_feed(self) -> AttentionRunResult:
         return await self._scan_feed("smartmoney", scoring.SMART_MONEY)
@@ -140,6 +234,7 @@ class AttentionEngineService:
                 )
                 result.gmgn_calls += 1
                 self._save_token_snapshot(watched_token, overview)
+                self._sync_social_identity_from_overview(watched_token, overview)
                 assessment = await self.assess_token(watched_token.wallet_id, watched_token.token_address)
                 if assessment:
                     result.assessments_created += 1
@@ -227,8 +322,10 @@ class AttentionEngineService:
                 top_holder,
                 cluster,
             )
-            smart_score, smart_direction = self._feed_family(session, wallet_id, token_address, scoring.SMART_MONEY)
-            kol_score, kol_direction = self._feed_family(session, wallet_id, token_address, scoring.KOL)
+            smart_fact = self._feed_family_fact(session, wallet_id, token_address, scoring.SMART_MONEY)
+            smart_score, smart_direction = _feed_score_direction(smart_fact)
+            kol_fact = self._feed_family_fact(session, wallet_id, token_address, scoring.KOL)
+            kol_score, kol_direction = _feed_score_direction(kol_fact)
             liq_score, liq_direction = self._liquidity_family(
                 session,
                 wallet_id,
@@ -242,6 +339,16 @@ class AttentionEngineService:
                 scoring.SMART_MONEY: smart_score,
                 scoring.KOL: kol_score,
                 scoring.LIQUIDITY: liq_score,
+            }
+            assessment_scores = {
+                "price_score": price_score,
+                "holder_breadth_score": holder_breadth,
+                "top_holder_score": top_holder,
+                "holder_cluster_score": cluster,
+                "holder_family_score": holder_family,
+                "smart_money_score": smart_score,
+                "kol_score": kol_score,
+                "liquidity_score": liq_score,
             }
             primary_family, primary_score = max(family_scores.items(), key=lambda item: item[1])
             if primary_score == 0:
@@ -261,6 +368,18 @@ class AttentionEngineService:
                     liq_direction if liq_score else scoring.NEUTRAL,
                 ]
             )
+            primary_signal = _primary_signal_for_family(primary_family, holder_breadth, top_holder, cluster)
+            primary_direction = _primary_direction_for_family(
+                primary_family,
+                {
+                    scoring.PRICE: price_direction,
+                    scoring.HOLDER: _holder_primary_direction(primary_signal, holder_breadth_direction),
+                    scoring.SMART_MONEY: _feed_primary_display_direction(smart_fact, smart_direction),
+                    scoring.KOL: _feed_primary_display_direction(kol_fact, kol_direction),
+                    scoring.LIQUIDITY: liq_direction,
+                },
+                direction,
+            )
             evidence = self._evidence(
                 session,
                 wallet_id,
@@ -272,6 +391,10 @@ class AttentionEngineService:
                 price_window,
                 watched.watch_started_at,
                 assessment_trigger,
+                assessment_scores,
+                primary_family,
+                primary_direction,
+                primary_signal,
             )
             should_notify = self._should_notify(session, wallet_id, token_address, level, final, direction, family_scores, now)
             assessment = AttentionAssessment(
@@ -309,7 +432,13 @@ class AttentionEngineService:
             session.expunge(assessment)
             return assessment
 
-    async def handle_price_snapshot_update(self, wallet_id: int, token_address: str) -> AttentionAssessment | None:
+    async def handle_price_snapshot_update(
+        self,
+        wallet_id: int,
+        token_address: str,
+        *,
+        confirmed_pending_usd_threshold_crossing: bool = False,
+    ) -> AttentionAssessment | None:
         trigger: str | None = None
         allow_below_min_value = False
         with session_scope(self.session_factory) as session:
@@ -343,7 +472,11 @@ class AttentionEngineService:
                 if price_score <= 0:
                     return None
                 trigger = "price_threshold"
-            elif previous_usd is not None and previous_usd >= min_usd:
+            elif (
+                confirmed_pending_usd_threshold_crossing
+                or previous_usd is not None
+                and previous_usd >= min_usd
+            ):
                 allow_below_min_value = True
                 trigger = "usd_threshold_crossing"
             else:
@@ -411,7 +544,7 @@ class AttentionEngineService:
     async def send_test_assessment(self, assessment: AttentionAssessment, chat_id: int) -> bool:
         if not self.notifier:
             raise RuntimeError("telegram_notifier_not_configured")
-        await self.notifier(chat_id, format_attention_alert(assessment))
+        await self._call_notifier(chat_id, format_attention_alert(assessment), build_attention_copy_markup(assessment))
         return True
 
     def latest_assessment_for_symbol(self, telegram_user_id: int, symbol: str) -> list[AttentionAssessment]:
@@ -560,6 +693,7 @@ class AttentionEngineService:
                 PriceSnapshot.wallet_id == TokenWatchState.wallet_id,
                 PriceSnapshot.token_address == TokenWatchState.token_address,
                 PriceSnapshot.observed_at >= TokenWatchState.started_at,
+                _valid_price_snapshot_clause(),
             )
             .correlate(TokenWatchState)
             .scalar_subquery()
@@ -571,7 +705,8 @@ class AttentionEngineService:
                 PriceSnapshot,
                 (PriceSnapshot.wallet_id == TokenWatchState.wallet_id)
                 & (PriceSnapshot.token_address == TokenWatchState.token_address)
-                & (PriceSnapshot.observed_at == latest_price_observed),
+                & (PriceSnapshot.observed_at == latest_price_observed)
+                & _valid_price_snapshot_clause(),
             )
             .where(TokenWatchState.active.is_(True), Wallet.is_active.is_(True))
             .order_by(TokenWatchState.last_seen_at.asc(), TokenWatchState.id.asc())
@@ -616,6 +751,20 @@ class AttentionEngineService:
                     holder_count=overview.holder_count,
                     observed_at=utc_now(),
                 )
+            )
+
+    def _sync_social_identity_from_overview(
+        self,
+        watched: WatchedToken,
+        overview: GmgnTokenOverview,
+    ) -> None:
+        try:
+            self.social_identity_service.sync_from_token_overview(watched, overview)
+        except Exception as exc:
+            logger.warning(
+                "Social identity sync failed token=%s: %s",
+                watched.token_address,
+                exc,
             )
 
     def _save_top_holder_snapshots(self, watched: WatchedToken, holders: list[GmgnHolder]) -> None:
@@ -802,6 +951,7 @@ class AttentionEngineService:
         query = select(PriceSnapshot).where(
             PriceSnapshot.wallet_id == wallet_id,
             PriceSnapshot.token_address == token_address,
+            _valid_price_snapshot_clause(),
         )
         if watch_started_at is not None:
             query = query.where(PriceSnapshot.observed_at >= watch_started_at)
@@ -822,6 +972,7 @@ class AttentionEngineService:
                 PriceSnapshot.token_address == token_address,
                 PriceSnapshot.observed_at >= watch_started_at,
                 PriceSnapshot.observed_at < before_observed_at,
+                _valid_price_snapshot_clause(),
             )
             .order_by(PriceSnapshot.observed_at.desc())
         )
@@ -934,6 +1085,7 @@ class AttentionEngineService:
                     PriceSnapshot.token_address == token_address,
                     PriceSnapshot.observed_at >= lower_bound,
                     PriceSnapshot.observed_at <= target + tolerance,
+                    _valid_price_snapshot_clause(),
                 )
             )
         )
@@ -963,6 +1115,7 @@ class AttentionEngineService:
                     PriceSnapshot.token_address == token_address,
                     PriceSnapshot.observed_at >= latest.observed_at - timedelta(hours=24),
                     PriceSnapshot.observed_at <= latest.observed_at,
+                    _valid_price_snapshot_clause(),
                 )
                 .order_by(PriceSnapshot.observed_at.asc())
             )
@@ -1008,27 +1161,51 @@ class AttentionEngineService:
         latest_intel,
         watch_started_at: datetime | None = None,
     ) -> tuple[int, str]:
-        if not latest_intel:
+        fact = self._holder_count_fact(session, wallet_id, token_address, latest_intel, watch_started_at)
+        if not fact:
             return 0, scoring.NEUTRAL
+        return fact.score, fact.direction
+
+    def _holder_count_fact(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        latest_intel,
+        watch_started_at: datetime | None = None,
+    ) -> HolderCountFact | None:
+        if not latest_intel:
+            return None
         baseline = self._baseline_token_snapshot(
             session,
             wallet_id,
             token_address,
-            60,
+            HOLDER_COUNT_WINDOW_MINUTES,
             latest_intel.observed_at,
             watch_started_at,
         )
+        if latest_intel.holder_count is None or not baseline or baseline.holder_count is None or baseline.holder_count <= 0:
+            return None
         score = scoring.holder_breadth_score(
             latest_intel.holder_count,
-            baseline.holder_count if baseline else None,
+            baseline.holder_count,
         )
-        if score == 0 or latest_intel.holder_count is None or not baseline or baseline.holder_count is None:
-            return score, scoring.NEUTRAL
+        delta = latest_intel.holder_count - baseline.holder_count
+        change_pct = (Decimal(delta) / Decimal(baseline.holder_count)) * Decimal("100") if baseline.holder_count else Decimal("0")
+        direction = scoring.NEUTRAL
         if latest_intel.holder_count > baseline.holder_count:
-            return score, scoring.POSITIVE
-        if latest_intel.holder_count < baseline.holder_count:
-            return score, scoring.NEGATIVE
-        return score, scoring.NEUTRAL
+            direction = scoring.POSITIVE
+        elif latest_intel.holder_count < baseline.holder_count:
+            direction = scoring.NEGATIVE
+        return HolderCountFact(
+            score=score,
+            direction=direction if score else scoring.NEUTRAL,
+            window_minutes=HOLDER_COUNT_WINDOW_MINUTES,
+            baseline_count=baseline.holder_count,
+            current_count=latest_intel.holder_count,
+            delta_count=delta,
+            change_pct=change_pct,
+        )
 
     def _holder_family_direction(self, breadth: int, breadth_direction: str, top_holder: int, cluster: int) -> str:
         directions: list[str] = []
@@ -1144,9 +1321,13 @@ class AttentionEngineService:
         )
 
     def _feed_family(self, session, wallet_id: int, token_address: str, family: str) -> tuple[int, str]:
+        fact = self._feed_family_fact(session, wallet_id, token_address, family)
+        return _feed_score_direction(fact)
+
+    def _feed_family_fact(self, session, wallet_id: int, token_address: str, family: str) -> FeedFamilyFact | None:
         watch_started_at = self._watch_started_at(session, wallet_id, token_address)
         if not watch_started_at:
-            return 0, scoring.NEUTRAL
+            return None
         cutoff = max(
             utc_now() - timedelta(minutes=self.settings.attention_feed_window_minutes),
             watch_started_at,
@@ -1164,17 +1345,21 @@ class AttentionEngineService:
             )
         )
         if not events:
-            return 0, scoring.NEUTRAL
+            return None
         buy_wallets: set[str] = set()
         sell_wallets: set[str] = set()
         buy_usd = Decimal("0")
         sell_usd = Decimal("0")
+        usd_complete = True
         buy_activity_count = 0
         sell_activity_count = 0
         for event in events:
             payload = _json_loads(event.payload_json)
             wallet = payload.get("wallet")
-            usd = _decimal_or_none(payload.get("usd_value")) or Decimal("0")
+            usd = _decimal_or_none(payload.get("usd_value"))
+            if usd is None:
+                usd_complete = False
+                usd = Decimal("0")
             if event.direction == scoring.POSITIVE:
                 if wallet:
                     buy_wallets.add(str(wallet))
@@ -1187,8 +1372,10 @@ class AttentionEngineService:
                 sell_activity_count += 1
         latest_intel = self._latest_token_snapshot(session, wallet_id, token_address, watch_started_at)
         liquidity = _decimal_or_none(latest_intel.liquidity_usd if latest_intel else None)
+        net_flow = buy_usd - sell_usd
+        buy_score = 0
+        sell_score = 0
         if family == scoring.SMART_MONEY:
-            net_flow = buy_usd - sell_usd
             buy_score = (
                 scoring.smart_money_score(len(buy_wallets), net_flow, liquidity, 0, buy_activity_count)
                 if net_flow > 0
@@ -1199,22 +1386,35 @@ class AttentionEngineService:
                 if net_flow < 0
                 else 0
             )
-            if buy_score > sell_score:
-                return buy_score, scoring.POSITIVE
-            if sell_score > buy_score:
-                return sell_score, scoring.NEGATIVE
-            if buy_score > 0:
-                return buy_score, scoring.MIXED
-            return 0, scoring.NEUTRAL
-        buy_score = scoring.kol_score(len(buy_wallets), 0, buy_activity_count)
-        sell_score = scoring.kol_score(len(sell_wallets), 0, sell_activity_count)
+        else:
+            buy_score = scoring.kol_score(len(buy_wallets), 0, buy_activity_count)
+            sell_score = scoring.kol_score(len(sell_wallets), 0, sell_activity_count)
+        score = 0
+        direction = scoring.NEUTRAL
         if buy_score > sell_score:
-            return buy_score, scoring.POSITIVE
-        if sell_score > buy_score:
-            return sell_score, scoring.NEGATIVE
-        if buy_score > 0:
-            return buy_score, scoring.MIXED
-        return 0, scoring.NEUTRAL
+            score = buy_score
+            direction = scoring.POSITIVE
+        elif sell_score > buy_score:
+            score = sell_score
+            direction = scoring.NEGATIVE
+        elif buy_score > 0:
+            score = buy_score
+            direction = scoring.MIXED
+        return FeedFamilyFact(
+            family=family,
+            score=score,
+            direction=direction,
+            window_minutes=self.settings.attention_feed_window_minutes,
+            buy_wallets=len(buy_wallets),
+            sell_wallets=len(sell_wallets),
+            net_directional_wallets=len(buy_wallets) - len(sell_wallets),
+            buy_usd=buy_usd if usd_complete else None,
+            sell_usd=sell_usd if usd_complete else None,
+            net_usd=net_flow if usd_complete else None,
+            usd_complete=usd_complete,
+            buy_activity_count=buy_activity_count,
+            sell_activity_count=sell_activity_count,
+        )
 
     def _liquidity_family(
         self,
@@ -1224,22 +1424,218 @@ class AttentionEngineService:
         latest_intel,
         watch_started_at: datetime | None = None,
     ) -> tuple[int, str]:
-        if not latest_intel:
+        fact = self._liquidity_fact(session, wallet_id, token_address, latest_intel, watch_started_at)
+        if not fact:
             return 0, scoring.NEUTRAL
+        return fact.score, fact.direction
+
+    def _liquidity_fact(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        latest_intel,
+        watch_started_at: datetime | None = None,
+    ) -> LiquidityFact | None:
+        if not latest_intel:
+            return None
         baseline = self._baseline_token_snapshot(
             session,
             wallet_id,
             token_address,
-            60,
+            LIQUIDITY_WINDOW_MINUTES,
             latest_intel.observed_at,
             watch_started_at,
         )
+        current = _decimal_or_none(latest_intel.liquidity_usd)
+        baseline_value = _decimal_or_none(baseline.liquidity_usd if baseline else None)
+        if current is None or baseline_value is None or baseline_value <= 0:
+            return None
         score = scoring.liquidity_score(
-            _decimal_or_none(latest_intel.liquidity_usd),
-            _decimal_or_none(baseline.liquidity_usd if baseline else None),
+            current,
+            baseline_value,
             None,
         )
-        return score, scoring.NEGATIVE if score else scoring.NEUTRAL
+        change_pct = ((current - baseline_value) / baseline_value) * Decimal("100")
+        return LiquidityFact(
+            score=score,
+            direction=scoring.NEGATIVE if score else scoring.NEUTRAL,
+            window_minutes=LIQUIDITY_WINDOW_MINUTES,
+            baseline_usd=baseline_value,
+            current_usd=current,
+            change_pct=change_pct,
+        )
+
+    def _display_facts(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        latest_price,
+        latest_intel,
+        price_score: int,
+        price_change: Decimal | None,
+        price_window: int | None,
+        watch_started_at: datetime | None,
+    ) -> dict[str, Any]:
+        facts: dict[str, Any] = {}
+        price_fact = self._price_display_fact(
+            session,
+            wallet_id,
+            token_address,
+            latest_price,
+            latest_intel,
+            price_score,
+            price_change,
+            price_window,
+            watch_started_at,
+        )
+        if price_fact:
+            facts["price"] = price_fact
+        holder_fact = self._holder_count_fact(session, wallet_id, token_address, latest_intel, watch_started_at)
+        if holder_fact:
+            facts["holder_count"] = {
+                "window_minutes": holder_fact.window_minutes,
+                "baseline_count": holder_fact.baseline_count,
+                "current_count": holder_fact.current_count,
+                "delta_count": holder_fact.delta_count,
+                "change_pct": str(holder_fact.change_pct),
+            }
+        top10_fact = self._top10_fact(session, wallet_id, token_address, watch_started_at)
+        if top10_fact:
+            facts["top10"] = top10_fact
+        smart_fact = self._feed_family_fact(session, wallet_id, token_address, scoring.SMART_MONEY)
+        if smart_fact:
+            facts["smart_money"] = _feed_fact_to_dict(smart_fact)
+        kol_fact = self._feed_family_fact(session, wallet_id, token_address, scoring.KOL)
+        if kol_fact:
+            facts["kol"] = _feed_fact_to_dict(kol_fact)
+        liquidity_fact = self._liquidity_fact(session, wallet_id, token_address, latest_intel, watch_started_at)
+        if liquidity_fact:
+            facts["liquidity"] = {
+                "window_minutes": liquidity_fact.window_minutes,
+                "baseline_usd": str(liquidity_fact.baseline_usd),
+                "current_usd": str(liquidity_fact.current_usd),
+                "change_pct": str(liquidity_fact.change_pct),
+            }
+        return facts
+
+    def _price_display_fact(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        latest_price,
+        latest_intel,
+        price_score: int,
+        price_change: Decimal | None,
+        price_window: int | None,
+        watch_started_at: datetime | None,
+    ) -> dict[str, str | int] | None:
+        if not latest_price:
+            return None
+        latest_value = _decimal_or_none(latest_price.price_usd)
+        if latest_value is None or latest_value <= 0:
+            return None
+        if price_score > 0 and price_change is not None and price_window is not None:
+            baseline = self._baseline_price_snapshot(
+                session,
+                wallet_id,
+                token_address,
+                latest_price.observed_at,
+                price_window,
+                watch_started_at,
+            )
+            baseline_value = _decimal_or_none(baseline.price_usd if baseline else None)
+            return {
+                "window_minutes": price_window,
+                "change_pct": str(price_change),
+                "current_price": str(latest_value),
+                "baseline_price": str(baseline_value) if baseline_value is not None else None,
+            }
+        for window in (5, 15, 60):
+            baseline = self._baseline_price_snapshot(
+                session,
+                wallet_id,
+                token_address,
+                latest_price.observed_at,
+                window,
+                watch_started_at,
+            )
+            baseline_value = _decimal_or_none(baseline.price_usd if baseline else None)
+            if baseline_value is None or baseline_value <= 0:
+                continue
+            change = ((latest_value - baseline_value) / baseline_value) * Decimal("100")
+            return {
+                "window_minutes": window,
+                "change_pct": str(change),
+                "current_price": str(latest_value),
+                "baseline_price": str(baseline_value),
+            }
+        return None
+
+    def _top10_fact(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_started_at: datetime | None,
+    ) -> dict[str, str | int] | None:
+        if not watch_started_at:
+            return None
+        latest_at = session.scalar(
+            select(func.max(TopHolderSnapshot.observed_at)).where(
+                TopHolderSnapshot.wallet_id == wallet_id,
+                TopHolderSnapshot.token_address == token_address,
+                TopHolderSnapshot.observed_at >= watch_started_at,
+            )
+        )
+        if not latest_at:
+            return None
+        previous_at = session.scalar(
+            select(func.max(TopHolderSnapshot.observed_at)).where(
+                TopHolderSnapshot.wallet_id == wallet_id,
+                TopHolderSnapshot.token_address == token_address,
+                TopHolderSnapshot.observed_at >= watch_started_at,
+                TopHolderSnapshot.observed_at < latest_at,
+            )
+        )
+        if not previous_at:
+            return None
+        current_share = self._top10_share_at(session, wallet_id, token_address, latest_at)
+        previous_share = self._top10_share_at(session, wallet_id, token_address, previous_at)
+        if current_share is None or previous_share is None or previous_share <= 0:
+            return None
+        change_pct = ((current_share - previous_share) / previous_share) * Decimal("100")
+        window_minutes = int(round((latest_at - previous_at).total_seconds() / 60))
+        if window_minutes > TOP10_DISPLAY_MAX_WINDOW_MINUTES:
+            return None
+        if abs(change_pct) < TOP10_DISPLAY_MIN_ABS_CHANGE_PCT:
+            return None
+        return {
+            "window_minutes": window_minutes,
+            "baseline_share": str(previous_share),
+            "current_share": str(current_share),
+            "change_pct": str(change_pct),
+        }
+
+    def _top10_share_at(self, session, wallet_id: int, token_address: str, observed_at: datetime) -> Decimal | None:
+        shares = [
+            _decimal_or_none(snapshot.hold_percentage)
+            for snapshot in session.scalars(
+                select(TopHolderSnapshot).where(
+                    TopHolderSnapshot.wallet_id == wallet_id,
+                    TopHolderSnapshot.token_address == token_address,
+                    TopHolderSnapshot.observed_at == observed_at,
+                    TopHolderSnapshot.dropped_out_top20.is_(False),
+                    TopHolderSnapshot.hold_percentage.is_not(None),
+                )
+            )
+        ]
+        clean = sorted((share for share in shares if share is not None), reverse=True)
+        if not clean:
+            return None
+        return sum(clean[:10], Decimal("0"))
 
     def _evidence(
         self,
@@ -1253,6 +1649,10 @@ class AttentionEngineService:
         price_window: int | None,
         watch_started_at: datetime | None = None,
         assessment_trigger: str | None = None,
+        assessment_scores: dict[str, int] | None = None,
+        primary_family: str | None = None,
+        primary_direction: str | None = None,
+        primary_signal: str | None = None,
     ) -> dict[str, Any]:
         cutoff = utc_now() - timedelta(minutes=self.settings.attention_event_aggregation_minutes)
         if watch_started_at is not None:
@@ -1269,9 +1669,29 @@ class AttentionEngineService:
             )
         )
         dropped_out_top20 = self._dropped_out_top20_evidence(session, wallet_id, token_address)
+        display_facts = self._display_facts(
+            session,
+            wallet_id,
+            token_address,
+            latest_price,
+            latest_intel,
+            family_scores.get(scoring.PRICE, 0),
+            price_change,
+            price_window,
+            watch_started_at,
+        )
+        position_intelligence = build_position_intelligence(
+            assessment_scores or {"price_score": family_scores.get(scoring.PRICE, 0)},
+            display_facts,
+        )
         return {
             "assessment_trigger": assessment_trigger,
+            "primary_family": primary_family,
+            "primary_direction": primary_direction,
+            "primary_signal": primary_signal,
             "family_scores": family_scores,
+            "display_facts": display_facts,
+            "position_intelligence": position_intelligence.to_dict(),
             "price_change_pct": str(price_change) if price_change is not None else None,
             "price_window_minutes": price_window,
             "current_price": str(latest_price.price_usd) if latest_price else None,
@@ -1375,48 +1795,82 @@ class AttentionEngineService:
     async def _notify_assessment(self, assessment: AttentionAssessment) -> bool:
         if not self.notifier:
             return False
-        with session_scope(self.session_factory) as session:
-            wallet = session.get(Wallet, assessment.wallet_id)
-            if not wallet:
-                return False
-            if not self._assessment_matches_current_watch(session, assessment):
-                logger.info(
-                    "Attention Telegram skipped stale assessment wallet_id=%s token=%s assessed_at=%s",
+        lock = self._notification_lock(assessment.wallet_id, assessment.token_address)
+        async with lock:
+            with session_scope(self.session_factory) as session:
+                wallet = session.get(Wallet, assessment.wallet_id)
+                if not wallet:
+                    return False
+                if not self._assessment_matches_current_watch(session, assessment):
+                    logger.info(
+                        "Attention Telegram skipped stale assessment wallet_id=%s token=%s assessed_at=%s",
+                        assessment.wallet_id,
+                        assessment.token_address,
+                        assessment.assessed_at,
+                    )
+                    return False
+                if not self._should_notify(
+                    session,
                     assessment.wallet_id,
                     assessment.token_address,
-                    assessment.assessed_at,
+                    assessment.attention_level,
+                    assessment.final_attention_score,
+                    assessment.direction,
+                    _family_scores_from_assessment(assessment),
+                    utc_now(),
+                ):
+                    logger.info(
+                        "Attention notification suppressed after serialized recheck wallet_id=%s token=%s score=%s level=%s",
+                        assessment.wallet_id,
+                        assessment.token_address,
+                        assessment.final_attention_score,
+                        assessment.attention_level,
+                    )
+                    return False
+                chat_id = wallet.user.telegram_chat_id
+            await self._send_notification_with_retry(
+                chat_id,
+                format_attention_alert(assessment),
+                assessment,
+                build_attention_copy_markup(assessment),
+            )
+            if not self._mark_notified(assessment):
+                logger.info(
+                    "Attention notification delivered but mark skipped stale assessment wallet_id=%s token=%s",
+                    assessment.wallet_id,
+                    assessment.token_address,
                 )
                 return False
-            chat_id = wallet.user.telegram_chat_id
-        await self._send_notification_with_retry(chat_id, format_attention_alert(assessment), assessment)
-        if not self._mark_notified(assessment):
             logger.info(
-                "Attention notification delivered but mark skipped stale assessment wallet_id=%s token=%s",
+                "Attention Telegram delivery success wallet_id=%s token=%s score=%s level=%s",
                 assessment.wallet_id,
                 assessment.token_address,
+                assessment.final_attention_score,
+                assessment.attention_level,
             )
-            return False
-        logger.info(
-            "Attention Telegram delivery success wallet_id=%s token=%s score=%s level=%s",
-            assessment.wallet_id,
-            assessment.token_address,
-            assessment.final_attention_score,
-            assessment.attention_level,
-        )
-        return True
+            return True
+
+    def _notification_lock(self, wallet_id: int, token_address: str) -> asyncio.Lock:
+        key = (wallet_id, token_address.lower())
+        lock = self._notification_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._notification_locks[key] = lock
+        return lock
 
     async def _send_notification_with_retry(
         self,
         chat_id: int,
         text: str,
         assessment: AttentionAssessment,
+        reply_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
         last_error: Exception | None = None
         for attempt, delay in enumerate(ATTENTION_NOTIFICATION_RETRY_DELAYS_SECONDS, start=1):
             if delay:
                 await asyncio.sleep(delay)
             try:
-                await self.notifier(chat_id, text)
+                await self._call_notifier(chat_id, text, reply_markup)
                 return
             except Exception as exc:
                 last_error = exc
@@ -1431,6 +1885,17 @@ class AttentionEngineService:
         if last_error:
             raise last_error
         raise RuntimeError("attention_notification_failed")
+
+    async def _call_notifier(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        if reply_markup is not None and _notifier_accepts_reply_markup(self.notifier):
+            await self.notifier(chat_id, text, reply_markup=reply_markup)
+            return
+        await self.notifier(chat_id, text)
 
     def _mark_notified(self, assessment: AttentionAssessment) -> bool:
         with session_scope(self.session_factory) as session:
@@ -1477,32 +1942,66 @@ def fingerprint_event(*parts: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _valid_price_snapshot_clause():
+    return or_(
+        PriceSnapshot.quality_status.is_(None),
+        PriceSnapshot.quality_status == PRICE_QUALITY_VALID,
+    )
+
+
 def format_attention_alert(assessment: AttentionAssessment) -> str:
     symbol = assessment.symbol or assessment.token_address[:10]
     emoji = "🔴" if assessment.direction == scoring.NEGATIVE else "🟠" if assessment.direction == scoring.MIXED else "🟢"
+    evidence = _json_loads(assessment.evidence_json)
+    trigger_title = format_directional_trigger_title(
+        assessment.primary_family,
+        evidence.get("primary_direction"),
+        evidence.get("assessment_trigger"),
+        evidence.get("primary_signal"),
+    )
     lines = [
-        f"{emoji} {symbol} 持仓异动",
+        f"{emoji} {symbol}",
         "",
-        f"Attention：{assessment.final_attention_score}｜{assessment.attention_level}",
-        f"方向：{_direction_label(assessment.direction)}",
+        f"{trigger_title}｜{_direction_label(assessment.direction)}｜ATT {assessment.final_attention_score}",
         "",
         "近况：",
     ]
-    evidence = _json_loads(assessment.evidence_json)
-    if evidence.get("price_change_pct"):
-        lines.append(f"• 价格 {_format_pct(Decimal(str(evidence['price_change_pct'])))}")
-    lines.append(f"• Holder Score {assessment.holder_family_score}")
-    lines.append(f"• Smart Money Score {assessment.smart_money_score}")
-    lines.append(f"• KOL Score {assessment.kol_score}")
-    lines.append(f"• Liquidity Score {assessment.liquidity_score}")
+    for fact_line in _display_fact_lines(evidence.get("display_facts")):
+        lines.append(fact_line)
+    position_intelligence = evidence.get("position_intelligence")
+    if isinstance(position_intelligence, dict) and position_intelligence.get("summary"):
+        lines.extend(
+            [
+                "",
+                f"判断：{position_intelligence['summary']}",
+            ]
+        )
     lines.extend(
         [
             "",
-            f"主要触发：{assessment.primary_family or 'none'}",
             "当前仅提示异动事实，不构成交易建议。",
         ]
     )
     return "\n".join(lines)
+
+
+def build_attention_copy_markup(assessment: AttentionAssessment) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"📋 {short_address(assessment.token_address)}",
+                    copy_text=CopyTextButton(assessment.token_address),
+                )
+            ]
+        ]
+    )
+
+
+def short_address(address: str) -> str:
+    if not address.startswith("0x") or len(address) <= 8:
+        return address
+    return f"{address[:5]}...{address[-3:]}"
 
 
 def format_attention_debug(assessment: AttentionAssessment) -> str:
@@ -1547,6 +2046,248 @@ def _decimal_or_none(value: Any) -> Decimal | None:
         return None
 
 
+def build_position_intelligence(
+    assessment_scores: dict[str, int],
+    display_facts: dict[str, Any] | None,
+) -> PositionIntelligenceResult:
+    facts = display_facts if isinstance(display_facts, dict) else {}
+    signals = _structure_signals(assessment_scores, facts)
+    by_family = {signal.family: signal for signal in signals}
+    positive_drivers = _driver_names(signals, scoring.POSITIVE)
+    negative_drivers = _driver_names(signals, scoring.NEGATIVE)
+    neutral_drivers = _driver_names(signals, scoring.NEUTRAL)
+    core_families = {"holder_count", "top10", scoring.SMART_MONEY, scoring.LIQUIDITY}
+    core_positive = [family for family in positive_drivers if family in core_families]
+    core_negative = [family for family in negative_drivers if family in core_families]
+    price_direction = _direction_for(by_family, scoring.PRICE)
+    smart_direction = _direction_for(by_family, scoring.SMART_MONEY)
+    holder_direction = _direction_for(by_family, "holder_count")
+    top10_direction = _direction_for(by_family, "top10")
+
+    if price_direction == scoring.NEGATIVE and len(core_negative) >= 2:
+        label = STRUCTURAL_DETERIORATION
+    elif price_direction == scoring.POSITIVE and len(core_positive) >= 2 and not core_negative:
+        label = MARKET_EXPANSION
+    elif (
+        price_direction == scoring.POSITIVE
+        and top10_direction == scoring.NEGATIVE
+        and (holder_direction != scoring.POSITIVE or smart_direction == scoring.NEGATIVE)
+    ):
+        label = MINORITY_DRIVEN
+    elif (
+        price_direction == scoring.NEGATIVE
+        and smart_direction == scoring.POSITIVE
+        and len(core_negative) < 2
+    ):
+        label = SUPPORT_EMERGING
+    elif positive_drivers and negative_drivers:
+        label = SIGNAL_DIVERGENCE
+    else:
+        label = NO_CLEAR_CHANGE
+
+    return PositionIntelligenceResult(
+        label=label,
+        label_cn=POSITION_LABELS_CN[label],
+        summary=_position_summary(label, by_family),
+        positive_drivers=positive_drivers,
+        negative_drivers=negative_drivers,
+        neutral_drivers=neutral_drivers,
+    )
+
+
+def _structure_signals(assessment_scores: dict[str, int], display_facts: dict[str, Any]) -> list[StructureSignal]:
+    signals: list[StructureSignal] = []
+    price_change = _fact_change(display_facts.get("price"))
+    price_score = int(assessment_scores.get("price_score", 0) or 0)
+    if price_score > 0 and price_change is not None and price_change != 0:
+        signals.append(
+            StructureSignal(
+                family=scoring.PRICE,
+                direction=scoring.POSITIVE if price_change > 0 else scoring.NEGATIVE,
+                strength=price_score,
+                value=str(price_change),
+                reason="price_up" if price_change > 0 else "price_down",
+            )
+        )
+    elif isinstance(display_facts.get("price"), dict):
+        signals.append(StructureSignal(scoring.PRICE, scoring.NEUTRAL, 0, str(price_change) if price_change is not None else None, "price_context"))
+
+    holder_change = _fact_change(display_facts.get("holder_count"))
+    holder_score = int(assessment_scores.get("holder_breadth_score", 0) or 0)
+    if holder_score > 0 and holder_change is not None and holder_change != 0:
+        signals.append(
+            StructureSignal(
+                family="holder_count",
+                direction=scoring.POSITIVE if holder_change > 0 else scoring.NEGATIVE,
+                strength=holder_score,
+                value=str(holder_change),
+                reason="holder_count_expanded" if holder_change > 0 else "holder_count_contracting",
+            )
+        )
+    elif isinstance(display_facts.get("holder_count"), dict):
+        signals.append(
+            StructureSignal("holder_count", scoring.NEUTRAL, holder_score, str(holder_change) if holder_change is not None else None, "holder_count_context")
+        )
+
+    top10_change = _fact_change(display_facts.get("top10"))
+    if top10_change is not None:
+        direction = scoring.NEUTRAL
+        reason = "top10_stable"
+        if top10_change >= Decimal("10"):
+            direction = scoring.NEGATIVE
+            reason = "concentration_increased"
+        elif top10_change <= Decimal("-10"):
+            direction = scoring.POSITIVE
+            reason = "concentration_decreased"
+        signals.append(
+            StructureSignal(
+                family="top10",
+                direction=direction,
+                strength=int(abs(top10_change)),
+                value=str(top10_change),
+                reason=reason,
+            )
+        )
+
+    smart_signal = _feed_structure_signal(scoring.SMART_MONEY, assessment_scores.get("smart_money_score", 0), display_facts.get("smart_money"))
+    if smart_signal:
+        signals.append(smart_signal)
+    kol_signal = _feed_structure_signal(scoring.KOL, assessment_scores.get("kol_score", 0), display_facts.get("kol"))
+    if kol_signal:
+        signals.append(kol_signal)
+
+    liquidity_change = _fact_change(display_facts.get("liquidity"))
+    liquidity_score = int(assessment_scores.get("liquidity_score", 0) or 0)
+    if liquidity_score > 0:
+        signals.append(
+            StructureSignal(
+                family=scoring.LIQUIDITY,
+                direction=scoring.NEGATIVE,
+                strength=liquidity_score,
+                value=str(liquidity_change) if liquidity_change is not None else None,
+                reason="liquidity_deteriorated",
+            )
+        )
+    elif liquidity_change is not None and liquidity_change >= Decimal("10"):
+        signals.append(
+            StructureSignal(
+                family=scoring.LIQUIDITY,
+                direction=scoring.POSITIVE,
+                strength=10,
+                value=str(liquidity_change),
+                reason="liquidity_improved",
+            )
+        )
+    elif isinstance(display_facts.get("liquidity"), dict):
+        signals.append(
+            StructureSignal(scoring.LIQUIDITY, scoring.NEUTRAL, 0, str(liquidity_change) if liquidity_change is not None else None, "liquidity_context")
+        )
+    return signals
+
+
+def _feed_structure_signal(family: str, score_value: int | None, fact: Any) -> StructureSignal | None:
+    if not isinstance(fact, dict):
+        return None
+    score_int = int(score_value or 0)
+    direction = scoring.NEUTRAL
+    value: str | None = None
+    net_usd = _decimal_or_none(fact.get("net_usd")) if fact.get("usd_complete") else None
+    if score_int > 0:
+        if net_usd is not None and net_usd != 0:
+            direction = scoring.POSITIVE if net_usd > 0 else scoring.NEGATIVE
+            value = str(net_usd)
+        else:
+            net_wallets = int(fact.get("net_wallets", 0) or 0)
+            if net_wallets > 0:
+                direction = scoring.POSITIVE
+            elif net_wallets < 0:
+                direction = scoring.NEGATIVE
+            value = str(net_wallets)
+    return StructureSignal(
+        family=family,
+        direction=direction,
+        strength=score_int,
+        value=value,
+        reason=_feed_reason(family, direction),
+    )
+
+
+def _feed_reason(family: str, direction: str) -> str:
+    prefix = "smart_money" if family == scoring.SMART_MONEY else "kol"
+    if direction == scoring.POSITIVE:
+        return f"{prefix}_net_inflow"
+    if direction == scoring.NEGATIVE:
+        return f"{prefix}_net_outflow"
+    return f"{prefix}_context"
+
+
+def _fact_change(fact: Any) -> Decimal | None:
+    if not isinstance(fact, dict):
+        return None
+    return _decimal_or_none(fact.get("change_pct"))
+
+
+def _driver_names(signals: list[StructureSignal], direction: str) -> list[str]:
+    return [signal.family for signal in _sorted_signals(signals) if signal.direction == direction]
+
+
+def _sorted_signals(signals: list[StructureSignal]) -> list[StructureSignal]:
+    order = {
+        scoring.PRICE: 0,
+        scoring.SMART_MONEY: 1,
+        "holder_count": 2,
+        "top10": 3,
+        scoring.LIQUIDITY: 4,
+        scoring.KOL: 5,
+    }
+    return sorted(signals, key=lambda signal: order.get(signal.family, 99))
+
+
+def _direction_for(signals: dict[str, StructureSignal], family: str) -> str:
+    signal = signals.get(family)
+    return signal.direction if signal else scoring.NEUTRAL
+
+
+def _position_summary(label: str, signals: dict[str, StructureSignal]) -> str:
+    price = _direction_for(signals, scoring.PRICE)
+    smart = _direction_for(signals, scoring.SMART_MONEY)
+    holder = _direction_for(signals, "holder_count")
+    top10 = _direction_for(signals, "top10")
+    liquidity = _direction_for(signals, scoring.LIQUIDITY)
+    kol = _direction_for(signals, scoring.KOL)
+    if label == STRUCTURAL_DETERIORATION:
+        if holder == scoring.NEGATIVE and smart == scoring.NEGATIVE:
+            return "价格下跌且持仓人数、资金流同步走弱，结构性风险上升。"
+        if top10 == scoring.NEGATIVE and liquidity == scoring.NEGATIVE:
+            return "价格走弱，同时筹码集中度提高、流动性下降，结构性恶化。"
+        return "价格走弱，多项结构信号同步转弱，结构性风险上升。"
+    if label == MARKET_EXPANSION:
+        if holder == scoring.POSITIVE and smart == scoring.POSITIVE:
+            return "价格走强，持仓人数与资金流同步改善，市场扩散增强。"
+        if top10 == scoring.POSITIVE and liquidity == scoring.POSITIVE:
+            return "价格上涨同时筹码趋于分散，市场扩散结构增强。"
+        return "价格走强，多项结构信号同步改善，市场扩散增强。"
+    if label == MINORITY_DRIVEN:
+        if smart == scoring.NEGATIVE:
+            return "价格上涨但筹码趋于集中，聪明钱净流出，偏少数资金推动。"
+        return "价格上涨但筹码趋于集中，市场扩散有限，偏少数资金推动。"
+    if label == SUPPORT_EMERGING:
+        if holder == scoring.POSITIVE:
+            return "价格走弱，但持仓人数与资金仍有承接。"
+        return "价格回落，但聪明钱出现净流入，短线存在承接。"
+    if label == SIGNAL_DIVERGENCE:
+        if price == scoring.POSITIVE and smart == scoring.NEGATIVE:
+            return "价格上涨，但聪明钱净流出，当前价格与资金信号分化。"
+        if holder == scoring.POSITIVE and top10 == scoring.NEGATIVE:
+            return "持仓人数增长，但筹码集中度提高，结构信号分化。"
+        if price == scoring.NEGATIVE and kol == scoring.POSITIVE:
+            return "价格走弱，但KOL资金净流入，当前信号分化。"
+        return "多项结构信号方向不一致，当前信号分化。"
+    if price in {scoring.POSITIVE, scoring.NEGATIVE}:
+        return "当前主要是价格异动，暂未看到明显结构共振。"
+    return "当前有效结构信号有限，暂未看到明显共振。"
+
+
 def _json_loads(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
@@ -1575,6 +2316,57 @@ def _family_scores_from_assessment(assessment: AttentionAssessment) -> dict[str,
     }
 
 
+def _primary_direction_for_family(
+    primary_family: str | None,
+    family_directions: dict[str, str],
+    assessment_direction: str,
+) -> str:
+    if primary_family is None:
+        return assessment_direction if assessment_direction in {scoring.POSITIVE, scoring.NEGATIVE, scoring.MIXED} else scoring.NEUTRAL
+    return family_directions.get(primary_family, scoring.NEUTRAL)
+
+
+def _primary_signal_for_family(primary_family: str | None, holder_breadth: int, top_holder: int, cluster: int) -> str | None:
+    if primary_family != scoring.HOLDER:
+        return None
+    holder_max = max(holder_breadth, top_holder, cluster)
+    if holder_max <= 0:
+        return None
+    if holder_breadth == holder_max:
+        return "holder_breadth"
+    if top_holder == holder_max:
+        return "top_holder_reduction"
+    return "holder_cluster_reduction"
+
+
+def _holder_primary_direction(primary_signal: str | None, holder_breadth_direction: str) -> str:
+    if primary_signal == "holder_breadth":
+        return holder_breadth_direction
+    if primary_signal in {"top_holder_reduction", "holder_cluster_reduction"}:
+        return scoring.NEGATIVE
+    return scoring.NEUTRAL
+
+
+def _feed_score_direction(fact: FeedFamilyFact | None) -> tuple[int, str]:
+    if not fact:
+        return 0, scoring.NEUTRAL
+    return fact.score, fact.direction
+
+
+def _feed_primary_display_direction(fact: FeedFamilyFact | None, scoring_direction: str) -> str:
+    if fact:
+        if fact.usd_complete and fact.net_usd is not None:
+            if fact.net_usd > 0:
+                return scoring.POSITIVE
+            if fact.net_usd < 0:
+                return scoring.NEGATIVE
+        if fact.net_directional_wallets > 0:
+            return scoring.POSITIVE
+        if fact.net_directional_wallets < 0:
+            return scoring.NEGATIVE
+    return scoring_direction
+
+
 def _direction_label(direction: str) -> str:
     return {
         scoring.POSITIVE: "Positive",
@@ -1584,6 +2376,189 @@ def _direction_label(direction: str) -> str:
     }.get(direction, direction)
 
 
+def format_directional_trigger_title(
+    primary_family: str | None,
+    primary_direction: Any,
+    assessment_trigger: str | None = None,
+    primary_signal: Any = None,
+) -> str:
+    if assessment_trigger == "usd_threshold_crossing":
+        return "持仓价值跌破$5"
+    direction = primary_direction if primary_direction in {scoring.POSITIVE, scoring.NEGATIVE, scoring.MIXED} else None
+    signal = primary_signal if isinstance(primary_signal, str) else None
+    if primary_family == scoring.PRICE:
+        return _directional_title(direction, "价格上涨", "价格下跌", "价格异动")
+    if primary_family == scoring.HOLDER:
+        if signal == "top_holder_reduction":
+            return "重要大户减仓"
+        if signal == "holder_cluster_reduction":
+            return "多名大户减仓"
+        if signal == "holder_structure":
+            return "筹码异动"
+        return _directional_title(direction, "持币人数增加", "持币人数减少", "持币人数异动")
+    if primary_family == scoring.SMART_MONEY:
+        return _directional_title(direction, "聪明钱流入", "聪明钱流出", "聪明钱异动")
+    if primary_family == scoring.KOL:
+        return _directional_title(direction, "KOL资金流入", "KOL资金流出", "KOL资金异动")
+    if primary_family == scoring.LIQUIDITY:
+        return _directional_title(direction, "流动性增加", "流动性减少", "流动性异动")
+    if primary_family in (None, "comprehensive"):
+        if direction == scoring.POSITIVE:
+            return "综合走强"
+        if direction == scoring.NEGATIVE:
+            return "综合走弱"
+        if direction == scoring.MIXED:
+            return "信号分化"
+        return "综合异动"
+    if primary_family == "social":
+        return _directional_title(direction, "社媒热度上升", "社媒热度下降", "社媒异动")
+    if primary_family == "dev":
+        return "DEV推特更新"
+    return "综合异动"
+
+
+def _directional_title(direction: str | None, positive: str, negative: str, fallback: str) -> str:
+    if direction == scoring.POSITIVE:
+        return positive
+    if direction == scoring.NEGATIVE:
+        return negative
+    return fallback
+
+
+def _display_fact_lines(display_facts: Any) -> list[str]:
+    if not isinstance(display_facts, dict):
+        return []
+    lines: list[str] = []
+    price = display_facts.get("price")
+    if isinstance(price, dict) and price.get("change_pct") is not None and price.get("window_minutes") is not None:
+        lines.append(
+            f"• 价格｜{_format_window(int(price['window_minutes']))} {_format_pct(Decimal(str(price['change_pct'])))}"
+        )
+    liquidity = display_facts.get("liquidity")
+    if (
+        isinstance(liquidity, dict)
+        and liquidity.get("change_pct") is not None
+        and liquidity.get("window_minutes") is not None
+    ):
+        lines.append(
+            f"• 流动性｜{_format_window(int(liquidity['window_minutes']))} {_format_pct(Decimal(str(liquidity['change_pct'])))}"
+        )
+    holder = display_facts.get("holder_count")
+    if isinstance(holder, dict) and holder.get("change_pct") is not None and holder.get("window_minutes") is not None:
+        lines.append(
+            f"• 持仓人数｜{_format_window(int(holder['window_minutes']))} {_format_pct(Decimal(str(holder['change_pct'])))}"
+        )
+    top10 = display_facts.get("top10")
+    if isinstance(top10, dict) and top10.get("change_pct") is not None and top10.get("window_minutes") is not None:
+        lines.append(
+            f"• Top10｜{_format_window(int(top10['window_minutes']))} {_format_pct(Decimal(str(top10['change_pct'])))}"
+        )
+    smart = display_facts.get("smart_money")
+    smart_line = _feed_display_line("聪明钱", smart)
+    if smart_line:
+        lines.append(smart_line)
+    kol = display_facts.get("kol")
+    kol_line = _feed_display_line("KOL", kol)
+    if kol_line:
+        lines.append(kol_line)
+    return lines
+
+
+def _feed_display_line(label: str, fact: Any) -> str | None:
+    if not isinstance(fact, dict):
+        return None
+    if fact.get("net_wallets") is None or fact.get("window_minutes") is None:
+        return None
+    parts = [
+        f"• {label}｜{_format_window(int(fact['window_minutes']))}",
+        f"{_format_signed_int(int(fact['net_wallets']))}钱包",
+    ]
+    if fact.get("usd_complete") and fact.get("net_usd") is not None:
+        parts.append(format_compact_usd(Decimal(str(fact["net_usd"])), signed=True))
+    return " ".join(parts)
+
+
+def _format_window(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, remainder = divmod(minutes, 60)
+    if remainder == 0:
+        return f"{hours}h"
+    return f"{hours}h{remainder}m"
+
+
+def _format_signed_int(value: int) -> str:
+    return f"+{value}" if value > 0 else str(value)
+
+
+def _trigger_reason_label(family: str | None) -> str:
+    return {
+        scoring.PRICE: "价格异动",
+        scoring.HOLDER: "Holder异动",
+        scoring.SMART_MONEY: "Smart Money异动",
+        scoring.KOL: "KOL异动",
+        scoring.LIQUIDITY: "流动性异动",
+        None: "综合异动",
+    }.get(family, "综合异动")
+
+
+def _notifier_accepts_reply_markup(notifier: Notifier | None) -> bool:
+    if notifier is None:
+        return False
+    try:
+        parameters = inspect.signature(notifier).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == "reply_markup"
+        for parameter in parameters
+    )
+
+
 def _format_pct(value: Decimal) -> str:
     sign = "+" if value > 0 else ""
-    return f"{sign}{value.quantize(Decimal('0.1'))}%"
+    rounded = value.quantize(Decimal("0.1"))
+    text = f"{rounded:f}"
+    if text.endswith(".0"):
+        text = text[:-2]
+    return f"{sign}{text}%"
+
+
+def format_compact_usd(value: Decimal, *, signed: bool = False) -> str:
+    sign = ""
+    if signed and value > 0:
+        sign = "+"
+    elif value < 0:
+        sign = "-"
+    absolute = abs(value)
+    if absolute >= Decimal("1000000"):
+        amount = _trim_decimal(absolute / Decimal("1000000"), Decimal("0.01"))
+        suffix = "m"
+    elif absolute >= Decimal("1000"):
+        amount = _trim_decimal(absolute / Decimal("1000"), Decimal("0.1"))
+        suffix = "k"
+    else:
+        amount = _trim_decimal(absolute, Decimal("1"))
+        suffix = ""
+    return f"{sign}${amount}{suffix}"
+
+
+def _trim_decimal(value: Decimal, quantum: Decimal) -> str:
+    rounded = value.quantize(quantum)
+    text = f"{rounded:f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _feed_fact_to_dict(fact: FeedFamilyFact) -> dict[str, Any]:
+    return {
+        "window_minutes": fact.window_minutes,
+        "buy_wallets": fact.buy_wallets,
+        "sell_wallets": fact.sell_wallets,
+        "net_wallets": fact.net_directional_wallets,
+        "buy_usd": str(fact.buy_usd) if fact.buy_usd is not None else None,
+        "sell_usd": str(fact.sell_usd) if fact.sell_usd is not None else None,
+        "net_usd": str(fact.net_usd) if fact.net_usd is not None else None,
+        "usd_complete": fact.usd_complete,
+    }

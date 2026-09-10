@@ -149,6 +149,22 @@ def test_empty_fields_parse_as_none() -> None:
     assert activity.tx_hash is None
 
 
+def test_holding_price_source_field_tracks_actual_price_field() -> None:
+    token_price = parse_holding("robinhood", {"token": {"price": "0.12", "address": TOKEN}})
+    item_price = parse_holding("robinhood", {"price": "0.34", "token": {"price": "0.12", "address": TOKEN}})
+    item_price_usd = parse_holding("robinhood", {"price_usd": "0.56", "token": {"address": TOKEN}})
+    item_current_price = parse_holding("robinhood", {"current_price_usd": "0.78", "token": {"address": TOKEN}})
+
+    assert token_price.current_price_usd == Decimal("0.12")
+    assert token_price.price_source_field == "token.price"
+    assert item_price.current_price_usd == Decimal("0.34")
+    assert item_price.price_source_field == "item.price"
+    assert item_price_usd.current_price_usd == Decimal("0.56")
+    assert item_price_usd.price_source_field == "item.price_usd"
+    assert item_current_price.current_price_usd == Decimal("0.78")
+    assert item_current_price.price_source_field == "item.current_price_usd"
+
+
 def test_token_overview_parser() -> None:
     overview = parse_token_overview(
         "robinhood",

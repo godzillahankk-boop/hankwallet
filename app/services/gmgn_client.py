@@ -95,6 +95,7 @@ class GmgnHolding:
     sell_tx_count: int | None
     last_active_time: int | None
     raw: dict[str, Any] = field(repr=False)
+    price_source_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -691,6 +692,15 @@ def parse_holding(chain: str, item: dict[str, Any]) -> GmgnHolding:
         "ca",
         "tokenAddress",
     )
+    price_value, price_source_field = _first_with_source(
+        "item",
+        item,
+        "token",
+        token,
+        "price",
+        "price_usd",
+        "current_price_usd",
+    )
     return GmgnHolding(
         chain=chain,
         token_name=_str_or_none(_first(item, token, "token_name", "name", "tokenName")),
@@ -698,7 +708,7 @@ def parse_holding(chain: str, item: dict[str, Any]) -> GmgnHolding:
         contract_address=_normalize_or_none(contract),
         decimals=_int_or_none(_first(item, token, "decimals", "decimal")),
         balance=_decimal_or_none(_first(item, token, "balance", "amount", "token_amount", "tokenAmount")),
-        current_price_usd=_decimal_or_none(_first(item, token, "price", "price_usd", "current_price_usd")),
+        current_price_usd=_decimal_or_none(price_value),
         usd_value=_decimal_or_none(_first(item, token, "usd_value", "value_usd", "value")),
         cost_usd=_decimal_or_none(_first(item, token, "cost", "cost_usd")),
         avg_cost_usd=_decimal_or_none(_first(item, token, "avg_cost", "avg_cost_usd")),
@@ -711,6 +721,7 @@ def parse_holding(chain: str, item: dict[str, Any]) -> GmgnHolding:
         sell_tx_count=_int_or_none(_first(item, token, "sell_tx_count", "sell_count", "sells", "history_total_sells")),
         last_active_time=_int_or_none(_first(item, token, "last_active_timestamp", "last_active_time", "last_trade_timestamp")),
         raw=item,
+        price_source_field=price_source_field,
     )
 
 
@@ -1098,6 +1109,20 @@ def _first(item: dict[str, Any], nested: dict[str, Any], *keys: str) -> Any:
             if key in source and source[key] not in (None, ""):
                 return source[key]
     return None
+
+
+def _first_with_source(
+    primary_name: str,
+    primary: dict[str, Any],
+    nested_name: str,
+    nested: dict[str, Any],
+    *keys: str,
+) -> tuple[Any, str | None]:
+    for source_name, source in ((primary_name, primary), (nested_name, nested)):
+        for key in keys:
+            if key in source and source[key] not in (None, ""):
+                return source[key], f"{source_name}.{key}"
+    return None, None
 
 
 def _first_from_sources(sources: list[dict[str, Any]], *keys: str) -> Any:

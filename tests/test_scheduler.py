@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 from decimal import Decimal
+import logging
+
+import pytest
 
 from app.core.config import Settings
-from app.core.scheduler import build_scheduler
-from app.main import validate_runtime_settings
+from app.core.scheduler import build_scheduler, report_social_shadow
+from app.main import build_social_auto_verification_components, build_social_memory_components, validate_runtime_settings
+from app.services.social_memory_service import SocialMemoryService
+from app.services.twitterapi_io_client import TwitterApiIoClient
+from app.services.twitterapi_io_profile_provider import TwitterApiIoSocialProfileProvider
 
 
 def settings() -> Settings:
@@ -102,6 +108,101 @@ def test_attention_engine_registers_independent_jobs() -> None:
     assert scheduler.get_job("scan_attention_top_holders").trigger.interval.total_seconds() == 60
 
 
+def test_social_cleanup_job_only_registers_when_social_enabled() -> None:
+    service = object()
+
+    disabled = build_scheduler(settings(), None, None, social_event_service=service)
+    enabled = build_scheduler(
+        replace(settings(), social_x_enabled=True),
+        None,
+        None,
+        social_event_service=service,
+    )
+
+    assert disabled.get_job("cleanup_social_events") is None
+    assert enabled.get_job("cleanup_social_events") is not None
+    assert enabled.get_job("cleanup_social_events").trigger.interval.total_seconds() == 86400
+
+
+def test_social_discovery_job_requires_social_and_discovery_enabled() -> None:
+    service = object()
+
+    disabled = build_scheduler(
+        settings(),
+        None,
+        None,
+        social_discovery_service=service,
+    )
+    social_only = build_scheduler(
+        replace(settings(), social_x_enabled=True, social_x_discovery_enabled=False),
+        None,
+        None,
+        social_discovery_service=service,
+    )
+    enabled = build_scheduler(
+        replace(
+            settings(),
+            social_x_enabled=True,
+            social_x_discovery_enabled=True,
+            social_x_discovery_dispatch_seconds=45,
+        ),
+        None,
+        None,
+        social_discovery_service=service,
+    )
+
+    assert disabled.get_job("scan_social_discovery") is None
+    assert social_only.get_job("scan_social_discovery") is None
+    assert enabled.get_job("scan_social_discovery") is not None
+    assert enabled.get_job("scan_social_discovery").trigger.interval.total_seconds() == 45
+
+
+def test_social_disabled_blocks_paid_social_jobs_but_keeps_attention_jobs() -> None:
+    scheduler = build_scheduler(
+        replace(settings(), social_x_enabled=False, social_x_discovery_enabled=True),
+        None,
+        None,
+        price_guardian_service=None,
+        attention_engine_service=object(),
+        social_event_service=object(),
+        social_discovery_service=object(),
+        social_shadow_reporter=object(),
+    )
+
+    assert scheduler.get_job("cleanup_social_events") is None
+    assert scheduler.get_job("scan_social_discovery") is None
+    assert scheduler.get_job("report_social_shadow") is None
+    assert scheduler.get_job("scan_attention_smart_money") is not None
+
+
+def test_social_shadow_report_job_only_registers_when_social_enabled() -> None:
+    reporter = object()
+
+    disabled = build_scheduler(settings(), None, None, social_shadow_reporter=reporter)
+    enabled = build_scheduler(
+        replace(settings(), social_x_enabled=True, social_shadow_report_seconds=17),
+        None,
+        None,
+        social_shadow_reporter=reporter,
+    )
+
+    assert disabled.get_job("report_social_shadow") is None
+    assert enabled.get_job("report_social_shadow") is not None
+    assert enabled.get_job("report_social_shadow").trigger.interval.total_seconds() == 17
+
+
+@pytest.mark.asyncio
+async def test_social_shadow_report_failure_is_isolated(caplog) -> None:
+    class FailingReporter:
+        def report(self) -> None:
+            raise RuntimeError("report down")
+
+    with caplog.at_level(logging.WARNING):
+        await report_social_shadow(FailingReporter())
+
+    assert "social shadow report failed" in caplog.text
+
+
 def test_attention_requires_price_guardian_enabled() -> None:
     app_settings = replace(
         settings(),
@@ -127,3 +228,108 @@ def test_attention_with_price_guardian_alerts_disabled_is_valid() -> None:
     )
 
     validate_runtime_settings(app_settings)
+
+
+def test_social_auto_verification_components_respect_feature_flags() -> None:
+    client = TwitterApiIoClient("twitter-key", base_url="https://twitterapi.test")
+    logger = logging.getLogger("test")
+
+    social_disabled = build_social_auto_verification_components(
+        replace(settings(), social_x_enabled=False, social_x_discovery_enabled=True, social_kol_auto_verify_enabled=True, deepseek_api_key="deepseek"),
+        client,
+        logger,
+    )
+    discovery_disabled = build_social_auto_verification_components(
+        replace(settings(), social_x_enabled=True, social_x_discovery_enabled=False, social_kol_auto_verify_enabled=True, deepseek_api_key="deepseek"),
+        client,
+        logger,
+    )
+    auto_disabled = build_social_auto_verification_components(
+        replace(settings(), social_x_enabled=True, social_x_discovery_enabled=True, social_kol_auto_verify_enabled=False, deepseek_api_key="deepseek"),
+        client,
+        logger,
+    )
+
+    assert social_disabled.auto_verify_enabled is False
+    assert discovery_disabled.auto_verify_enabled is False
+    assert auto_disabled.auto_verify_enabled is False
+    assert social_disabled.profile_provider is None
+    assert discovery_disabled.classifier is None
+    assert auto_disabled.profile_provider is None
+
+
+def test_social_auto_verification_wires_provider_and_classifier_when_key_exists() -> None:
+    client = TwitterApiIoClient("twitter-key", base_url="https://twitterapi.test")
+
+    components = build_social_auto_verification_components(
+        replace(
+            settings(),
+            social_x_enabled=True,
+            social_x_discovery_enabled=True,
+            social_kol_auto_verify_enabled=True,
+            deepseek_api_key="deepseek-key",
+        ),
+        client,
+        logging.getLogger("test"),
+    )
+
+    assert components.auto_verify_enabled is True
+    assert isinstance(components.profile_provider, TwitterApiIoSocialProfileProvider)
+    assert components.classifier is not None
+
+
+def test_social_auto_verification_missing_deepseek_key_degrades_without_blocking_discovery(caplog) -> None:
+    client = TwitterApiIoClient("twitter-key", base_url="https://twitterapi.test")
+
+    with caplog.at_level(logging.WARNING):
+        components = build_social_auto_verification_components(
+            replace(
+                settings(),
+                social_x_enabled=True,
+                social_x_discovery_enabled=True,
+                social_kol_auto_verify_enabled=True,
+                deepseek_api_key=None,
+            ),
+            client,
+            logging.getLogger("test"),
+        )
+
+    assert components.auto_verify_enabled is False
+    assert components.profile_provider is None
+    assert components.classifier is None
+    assert "DEEPSEEK_API_KEY is missing" in caplog.text
+
+
+def test_social_memory_components_default_disabled() -> None:
+    component = build_social_memory_components(settings(), object(), logging.getLogger("test"))
+
+    assert component is None
+
+
+def test_social_memory_components_missing_deepseek_key_degrades_without_blocking_social(caplog) -> None:
+    with caplog.at_level(logging.WARNING):
+        component = build_social_memory_components(
+            replace(settings(), social_memory_enabled=True, deepseek_api_key=None),
+            object(),
+            logging.getLogger("test"),
+        )
+
+    assert component is None
+    assert "SOCIAL_MEMORY_ENABLED=true but DEEPSEEK_API_KEY missing" in caplog.text
+
+
+def test_social_memory_components_wire_deepseek_adapter_when_key_exists() -> None:
+    component = build_social_memory_components(
+        replace(
+            settings(),
+            social_memory_enabled=True,
+            deepseek_api_key="deepseek-key",
+            deepseek_base_url="https://deepseek.test",
+            social_memory_triage_model="deepseek-chat",
+        ),
+        object(),
+        logging.getLogger("test"),
+    )
+
+    assert isinstance(component, SocialMemoryService)
+    assert component.triage_adapter is not None

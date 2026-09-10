@@ -7,20 +7,40 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.database import session_scope
-from app.db.models import AttentionAlertState, PriceAlertState, PriceSnapshot, TokenWatchState, Wallet
+from app.db.models import (
+    AttentionAlertState,
+    PriceAlertState,
+    PriceSnapshot,
+    TokenIntelligenceSnapshot,
+    TokenWatchState,
+    Wallet,
+)
+from app.services import attention_scoring
 from app.services.gmgn_client import GmgnClient, GmgnHolding
 from app.services.holding_classifier import is_trading_position
+from app.services.price_quality import (
+    PRICE_QUALITY_OUTLIER,
+    PRICE_QUALITY_PENDING,
+    PRICE_QUALITY_REASON_AMBIGUOUS_NEXT_SNAPSHOT,
+    PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT,
+    PRICE_QUALITY_REASON_REVERTED_NEXT_SNAPSHOT,
+    PRICE_QUALITY_REASON_SINGLE_SNAPSHOT_JUMP,
+    PRICE_QUALITY_VALID,
+    is_close_price,
+    percent_change,
+    price_quality_jump_threshold,
+)
 from app.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
 
 Notifier = Callable[[int, str], Awaitable[None]]
-PriceAttentionTrigger = Callable[[int, str], Awaitable[object]]
+PriceAttentionTrigger = Callable[..., Awaitable[object]]
 
 WINDOWS = (5, 15, 60)
 UP = "UP"
@@ -62,6 +82,14 @@ class PriceGuardianResult:
     snapshots_saved: int = 0
     alerts_sent: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PriceQualityResult:
+    current_status: str
+    resolved_pending: bool = False
+    resolved_pending_status: str | None = None
+    previous_valid_before_pending_usd_value: Decimal | None = None
 
 
 class PriceGuardianService:
@@ -145,7 +173,7 @@ class PriceGuardianService:
         result.holdings_found = len(holdings)
         now = utc_now()
         alerts: list[PriceAlert] = []
-        price_attention_tokens: set[tuple[int, str]] = set()
+        price_attention_tokens: dict[tuple[int, str], bool] = {}
         with session_scope(self.session_factory) as session:
             wallet = session.scalar(
                 select(Wallet).where(Wallet.id == wallet_id, Wallet.is_active.is_(True))
@@ -175,17 +203,41 @@ class PriceGuardianService:
                     balance=holding.balance,
                     usd_value=holding.usd_value,
                     observed_at=now,
+                    source_provider="gmgn",
+                    source_endpoint="/v1/user/wallet_holdings",
+                    source_field=holding.price_source_field,
+                )
+                quality_result = self._apply_price_quality(
+                    session,
+                    wallet.id,
+                    holding.contract_address,
+                    watch_state,
+                    snapshot,
                 )
                 session.add(snapshot)
                 result.snapshots_saved += 1
-                price_attention_tokens.add((wallet.id, holding.contract_address))
+                if snapshot.quality_status == PRICE_QUALITY_VALID:
+                    key = (wallet.id, holding.contract_address)
+                    price_attention_tokens[key] = price_attention_tokens.get(key, False) or (
+                        quality_result.resolved_pending
+                        and quality_result.resolved_pending_status == PRICE_QUALITY_VALID
+                        and quality_result.previous_valid_before_pending_usd_value is not None
+                        and quality_result.previous_valid_before_pending_usd_value
+                        >= self.settings.price_monitor_min_usd_value
+                        and holding.usd_value is not None
+                        and holding.usd_value < self.settings.price_monitor_min_usd_value
+                    )
                 candidate = self.classify_holding(holding)
                 if not candidate.monitored:
                     continue
                 result.monitored_tokens += 1
                 token_alert = (
                     self._evaluate_alerts(session, wallet, holding, watch_state, now)
-                    if send_alerts and self.settings.price_guardian_alerts_enabled
+                    if (
+                        send_alerts
+                        and self.settings.price_guardian_alerts_enabled
+                        and snapshot.quality_status == PRICE_QUALITY_VALID
+                    )
                     else None
                 )
                 if token_alert:
@@ -199,9 +251,16 @@ class PriceGuardianService:
             )
 
         if self.price_attention_trigger:
-            for trigger_wallet_id, token_address in sorted(price_attention_tokens):
+            for (trigger_wallet_id, token_address), confirmed_pending_crossing in sorted(price_attention_tokens.items()):
                 try:
-                    await self.price_attention_trigger(trigger_wallet_id, token_address)
+                    if confirmed_pending_crossing:
+                        await self.price_attention_trigger(
+                            trigger_wallet_id,
+                            token_address,
+                            confirmed_pending_usd_threshold_crossing=True,
+                        )
+                    else:
+                        await self.price_attention_trigger(trigger_wallet_id, token_address)
                 except Exception as exc:
                     logger.warning(
                         "Price Attention trigger failed wallet_id=%s token=%s: %s",
@@ -443,6 +502,7 @@ class PriceGuardianService:
                     PriceSnapshot.token_address == token_address,
                     PriceSnapshot.observed_at >= lower_bound,
                     PriceSnapshot.observed_at <= upper_bound,
+                    _valid_price_snapshot_clause(),
                 )
             )
         )
@@ -623,6 +683,188 @@ class PriceGuardianService:
             60: self.settings.price_alert_60m_percent,
         }
 
+    def _apply_price_quality(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_state: TokenWatchState,
+        snapshot: PriceSnapshot,
+    ) -> PriceQualityResult:
+        current_price = Decimal(str(snapshot.price_usd))
+        pending = self._latest_pending_snapshot(session, wallet_id, token_address, watch_state.started_at)
+        if pending:
+            return self._resolve_pending_snapshot(
+                session,
+                wallet_id,
+                token_address,
+                watch_state,
+                pending,
+                snapshot,
+                current_price,
+            )
+
+        previous_valid = self._latest_valid_snapshot(session, wallet_id, token_address, watch_state.started_at)
+        if not previous_valid:
+            snapshot.quality_status = PRICE_QUALITY_VALID
+            return PriceQualityResult(current_status=PRICE_QUALITY_VALID)
+        previous_price = Decimal(str(previous_valid.price_usd))
+        change = percent_change(current_price, previous_price)
+        threshold = self._quality_jump_threshold(
+            session,
+            wallet_id,
+            token_address,
+            watch_state.started_at,
+            current_price,
+            previous_price,
+        )
+        if change is not None and abs(change) >= threshold:
+            snapshot.quality_status = PRICE_QUALITY_PENDING
+            snapshot.quality_reason = PRICE_QUALITY_REASON_SINGLE_SNAPSHOT_JUMP
+            return PriceQualityResult(current_status=PRICE_QUALITY_PENDING)
+        snapshot.quality_status = PRICE_QUALITY_VALID
+        return PriceQualityResult(current_status=PRICE_QUALITY_VALID)
+
+    def _resolve_pending_snapshot(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_state: TokenWatchState,
+        pending: PriceSnapshot,
+        snapshot: PriceSnapshot,
+        current_price: Decimal,
+    ) -> PriceQualityResult:
+        pending_price = Decimal(str(pending.price_usd))
+        previous_valid = self._latest_valid_snapshot(
+            session,
+            wallet_id,
+            token_address,
+            watch_state.started_at,
+            before_observed_at=pending.observed_at,
+        )
+        if not previous_valid:
+            pending.quality_status = PRICE_QUALITY_VALID
+            pending.quality_reason = PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT
+            snapshot.quality_status = PRICE_QUALITY_VALID
+            return PriceQualityResult(
+                current_status=PRICE_QUALITY_VALID,
+                resolved_pending=True,
+                resolved_pending_status=PRICE_QUALITY_VALID,
+            )
+
+        previous_price = Decimal(str(previous_valid.price_usd))
+        previous_valid_usd = _decimal_or_none(previous_valid.usd_value)
+        if is_close_price(current_price, pending_price):
+            pending.quality_status = PRICE_QUALITY_VALID
+            pending.quality_reason = PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT
+            snapshot.quality_status = PRICE_QUALITY_VALID
+            snapshot.quality_reason = PRICE_QUALITY_REASON_CONFIRMED_NEXT_SNAPSHOT
+            return PriceQualityResult(
+                current_status=PRICE_QUALITY_VALID,
+                resolved_pending=True,
+                resolved_pending_status=PRICE_QUALITY_VALID,
+                previous_valid_before_pending_usd_value=previous_valid_usd,
+            )
+
+        if is_close_price(current_price, previous_price) and not is_close_price(current_price, pending_price):
+            pending.quality_status = PRICE_QUALITY_OUTLIER
+            pending.quality_reason = PRICE_QUALITY_REASON_REVERTED_NEXT_SNAPSHOT
+            snapshot.quality_status = PRICE_QUALITY_VALID
+            return PriceQualityResult(
+                current_status=PRICE_QUALITY_VALID,
+                resolved_pending=True,
+                resolved_pending_status=PRICE_QUALITY_OUTLIER,
+                previous_valid_before_pending_usd_value=previous_valid_usd,
+            )
+
+        pending.quality_status = PRICE_QUALITY_OUTLIER
+        pending.quality_reason = PRICE_QUALITY_REASON_AMBIGUOUS_NEXT_SNAPSHOT
+        threshold = self._quality_jump_threshold(
+            session,
+            wallet_id,
+            token_address,
+            watch_state.started_at,
+            current_price,
+            previous_price,
+        )
+        change = percent_change(current_price, previous_price)
+        if change is not None and abs(change) >= threshold:
+            snapshot.quality_status = PRICE_QUALITY_PENDING
+            snapshot.quality_reason = PRICE_QUALITY_REASON_SINGLE_SNAPSHOT_JUMP
+        else:
+            snapshot.quality_status = PRICE_QUALITY_VALID
+        return PriceQualityResult(
+            current_status=snapshot.quality_status,
+            resolved_pending=True,
+            resolved_pending_status=PRICE_QUALITY_OUTLIER,
+            previous_valid_before_pending_usd_value=previous_valid_usd,
+        )
+
+    def _latest_valid_snapshot(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_started_at,
+        before_observed_at=None,
+    ) -> PriceSnapshot | None:
+        query = select(PriceSnapshot).where(
+            PriceSnapshot.wallet_id == wallet_id,
+            PriceSnapshot.token_address == token_address,
+            PriceSnapshot.observed_at >= watch_started_at,
+            _valid_price_snapshot_clause(),
+        )
+        if before_observed_at is not None:
+            query = query.where(PriceSnapshot.observed_at < before_observed_at)
+        return session.scalar(query.order_by(PriceSnapshot.observed_at.desc()))
+
+    def _latest_pending_snapshot(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_started_at,
+    ) -> PriceSnapshot | None:
+        return session.scalar(
+            select(PriceSnapshot)
+            .where(
+                PriceSnapshot.wallet_id == wallet_id,
+                PriceSnapshot.token_address == token_address,
+                PriceSnapshot.observed_at >= watch_started_at,
+                PriceSnapshot.quality_status == PRICE_QUALITY_PENDING,
+            )
+            .order_by(PriceSnapshot.observed_at.desc())
+        )
+
+    def _quality_jump_threshold(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        watch_started_at,
+        current_price: Decimal,
+        previous_price: Decimal,
+    ) -> Decimal:
+        latest_intel = session.scalar(
+            select(TokenIntelligenceSnapshot)
+            .where(
+                TokenIntelligenceSnapshot.wallet_id == wallet_id,
+                TokenIntelligenceSnapshot.token_address == token_address,
+                TokenIntelligenceSnapshot.observed_at >= watch_started_at,
+            )
+            .order_by(TokenIntelligenceSnapshot.observed_at.desc())
+        )
+        market_cap = Decimal(str(latest_intel.market_cap_usd)) if latest_intel and latest_intel.market_cap_usd else None
+        liquidity = Decimal(str(latest_intel.liquidity_usd)) if latest_intel and latest_intel.liquidity_usd else None
+        direction = attention_scoring.POSITIVE if current_price > previous_price else attention_scoring.NEGATIVE
+        effective_threshold = (
+            attention_scoring.price_threshold(5, market_cap, liquidity, direction)
+            if market_cap is not None and market_cap > 0
+            else self.settings.price_alert_5m_percent
+        )
+        return price_quality_jump_threshold(effective_threshold)
+
     @staticmethod
     def _baseline_tolerance_seconds(window_minutes: int) -> int:
         return {5: 75, 15: 90, 60: 120}.get(window_minutes, 90)
@@ -691,3 +933,19 @@ def _window_label(window_minutes: int) -> str:
     if window_minutes == 60:
         return "1小时"
     return f"{window_minutes}分钟"
+
+
+def _valid_price_snapshot_clause():
+    return or_(
+        PriceSnapshot.quality_status.is_(None),
+        PriceSnapshot.quality_status == PRICE_QUALITY_VALID,
+    )
+
+
+def _decimal_or_none(value) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None

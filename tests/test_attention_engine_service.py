@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, timedelta
@@ -15,14 +16,35 @@ from app.db.models import (
     AttentionAssessment,
     IntelligenceEvent,
     PriceSnapshot,
+    SocialIdentity,
     TokenIntelligenceSnapshot,
     TokenWatchState,
     TopHolderPeak,
     TopHolderSnapshot,
 )
 from app.services import attention_scoring as scoring
-from app.services.attention_engine_service import AttentionEngineService, WatchedToken, fingerprint_event
-from app.services.gmgn_client import GmgnHolder, GmgnMarketSignal, GmgnTrackTrade
+from app.services.attention_engine_service import (
+    AttentionEngineService,
+    FeedFamilyFact,
+    MARKET_EXPANSION,
+    MINORITY_DRIVEN,
+    NO_CLEAR_CHANGE,
+    SIGNAL_DIVERGENCE,
+    STRUCTURAL_DETERIORATION,
+    SUPPORT_EMERGING,
+    WatchedToken,
+    build_attention_copy_markup,
+    build_position_intelligence,
+    fingerprint_event,
+    format_attention_alert,
+    format_compact_usd,
+    format_directional_trigger_title,
+    short_address,
+    _format_window,
+    _feed_primary_display_direction,
+)
+from app.services.gmgn_client import GmgnHolder, GmgnMarketSignal, GmgnTokenOverview, GmgnTrackTrade
+from app.services.price_quality import PRICE_QUALITY_OUTLIER, PRICE_QUALITY_PENDING, PRICE_QUALITY_VALID
 from app.services.wallet_service import WalletService
 from app.utils.time import utc_now
 
@@ -49,6 +71,17 @@ class FakeAttentionGmgn:
     async def get_market_signals(self, chain: str, *, groups):
         self.signal_calls += 1
         return self.signals
+
+
+class FakeOverviewGmgn(FakeAttentionGmgn):
+    def __init__(self, overview: GmgnTokenOverview) -> None:
+        super().__init__()
+        self.overview = overview
+        self.overview_calls = 0
+
+    async def get_token_overview(self, chain: str, token_address: str):
+        self.overview_calls += 1
+        return self.overview
 
 
 @pytest.fixture
@@ -206,6 +239,8 @@ def add_price_snapshot(
     price: str = "0.01",
     usd_value: str = "50",
     observed_at=None,
+    quality_status: str = "VALID",
+    quality_reason: str | None = None,
 ) -> None:
     observed_at = observed_at or utc_now()
     with session_scope(session_factory) as session:
@@ -219,6 +254,8 @@ def add_price_snapshot(
                 balance=Decimal("5000"),
                 usd_value=Decimal(usd_value),
                 observed_at=observed_at,
+                quality_status=quality_status,
+                quality_reason=quality_reason,
             )
         )
 
@@ -316,6 +353,194 @@ def holder(address: str, balance: str | None, hold_percentage: str) -> GmgnHolde
         twitter_username=None,
         raw={},
     )
+
+
+def add_intelligence_event(
+    session_factory,
+    wallet_id: int,
+    *,
+    token: str = TOKEN,
+    family: str = scoring.SMART_MONEY,
+    source: str = "gmgn_smartmoney",
+    direction: str = scoring.POSITIVE,
+    wallet: str = "0x1111111111111111111111111111111111111111",
+    usd: str | None = "1000",
+    event_at=None,
+) -> None:
+    event_at = event_at or utc_now()
+    payload = {"wallet": wallet}
+    if usd is not None:
+        payload["usd_value"] = usd
+    with session_scope(session_factory) as session:
+        session.add(
+            IntelligenceEvent(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=token,
+                symbol="WINK",
+                family=family,
+                event_type="trade",
+                direction=direction,
+                severity_score=0,
+                source=source,
+                source_event_id=None,
+                event_fingerprint=fingerprint_event(wallet_id, token, family, source, wallet, direction, usd, event_at),
+                event_at=event_at,
+                detected_at=event_at,
+                payload_json=json.dumps(payload),
+            )
+        )
+
+
+def add_top10_group(
+    session_factory,
+    wallet_id: int,
+    *,
+    token: str = TOKEN,
+    observed_at,
+    share_each: str,
+    prefix: str,
+) -> None:
+    with session_scope(session_factory) as session:
+        for index in range(10):
+            session.add(
+                TopHolderSnapshot(
+                    wallet_id=wallet_id,
+                    chain="robinhood",
+                    token_address=token,
+                    symbol="WINK",
+                    holder_address=f"0x{prefix}{index}",
+                    balance=Decimal("100"),
+                    hold_percentage=Decimal(share_each),
+                    usd_value=None,
+                    dropped_out_top20=False,
+                    observed_at=observed_at,
+                )
+            )
+
+
+def notification_assessment(
+    wallet_id: int,
+    token: str = TOKEN,
+    *,
+    symbol: str = "WINK",
+    final_score: int = 65,
+    level: str = scoring.WARNING,
+    direction: str = scoring.NEGATIVE,
+    price_score: int = 40,
+    holder_score: int = 0,
+    smart_score: int = 0,
+    kol_score: int = 0,
+    liquidity_score: int = 0,
+    assessed_at=None,
+) -> AttentionAssessment:
+    return AttentionAssessment(
+        wallet_id=wallet_id,
+        token_address=token,
+        symbol=symbol,
+        assessed_at=assessed_at or utc_now(),
+        price_score=price_score,
+        holder_breadth_score=0,
+        top_holder_score=0,
+        holder_cluster_score=0,
+        holder_family_score=holder_score,
+        smart_money_score=smart_score,
+        kol_score=kol_score,
+        liquidity_score=liquidity_score,
+        primary_family=scoring.PRICE,
+        primary_event_score=price_score,
+        position_exposure_score=20,
+        abnormality_score=5,
+        secondary_family_1=None,
+        secondary_family_1_score=0,
+        secondary_family_2=None,
+        secondary_family_2_score=0,
+        secondary_signal_score=0,
+        base_attention_score=final_score,
+        dev_modifier=0,
+        final_attention_score=final_score,
+        attention_level=level,
+        direction=direction,
+        should_notify=True,
+        evidence_json=json.dumps({"display_facts": {"price": {"window_minutes": 5, "change_pct": "30"}}}),
+    )
+
+
+def _test_feed_fact_dict(fact) -> dict[str, object]:
+    return {
+        "window_minutes": fact.window_minutes,
+        "buy_wallets": fact.buy_wallets,
+        "sell_wallets": fact.sell_wallets,
+        "net_wallets": fact.net_directional_wallets,
+        "buy_usd": str(fact.buy_usd) if fact.buy_usd is not None else None,
+        "sell_usd": str(fact.sell_usd) if fact.sell_usd is not None else None,
+        "net_usd": str(fact.net_usd) if fact.net_usd is not None else None,
+        "usd_complete": fact.usd_complete,
+    }
+
+
+def position_scores(
+    *,
+    price: int = 0,
+    holder: int = 0,
+    smart: int = 0,
+    kol: int = 0,
+    liquidity: int = 0,
+) -> dict[str, int]:
+    return {
+        "price_score": price,
+        "holder_breadth_score": holder,
+        "smart_money_score": smart,
+        "kol_score": kol,
+        "liquidity_score": liquidity,
+    }
+
+
+def position_facts(
+    *,
+    price: str | None = None,
+    holder: str | None = None,
+    top10: str | None = None,
+    smart_wallets: int | None = None,
+    smart_usd: str | None = None,
+    kol_wallets: int | None = None,
+    kol_usd: str | None = None,
+    liquidity: str | None = None,
+) -> dict[str, object]:
+    facts: dict[str, object] = {}
+    if price is not None:
+        facts["price"] = {"window_minutes": 5, "change_pct": price}
+    if holder is not None:
+        facts["holder_count"] = {
+            "window_minutes": 30,
+            "baseline_count": 500,
+            "current_count": 500 + int(Decimal(holder)),
+            "delta_count": int(Decimal(holder)),
+            "change_pct": holder,
+        }
+    if top10 is not None:
+        facts["top10"] = {"window_minutes": 15, "baseline_share": "0.42", "current_share": "0.50", "change_pct": top10}
+    if smart_wallets is not None:
+        facts["smart_money"] = {
+            "window_minutes": 15,
+            "buy_wallets": max(smart_wallets, 0),
+            "sell_wallets": abs(min(smart_wallets, 0)),
+            "net_wallets": smart_wallets,
+            "net_usd": smart_usd,
+            "usd_complete": smart_usd is not None,
+        }
+    if kol_wallets is not None:
+        facts["kol"] = {
+            "window_minutes": 15,
+            "buy_wallets": max(kol_wallets, 0),
+            "sell_wallets": abs(min(kol_wallets, 0)),
+            "net_wallets": kol_wallets,
+            "net_usd": kol_usd,
+            "usd_complete": kol_usd is not None,
+        }
+    if liquidity is not None:
+        facts["liquidity"] = {"window_minutes": 60, "baseline_usd": "100000", "current_usd": "90000", "change_pct": liquidity}
+    return facts
 
 
 @pytest.mark.asyncio
@@ -690,7 +915,7 @@ async def test_holder_breadth_direction_positive_and_negative(ctx) -> None:
                 market_cap_usd=Decimal("1000000"),
                 liquidity_usd=Decimal("100000"),
                 holder_count=500,
-                observed_at=now - timedelta(minutes=60),
+                observed_at=now - timedelta(minutes=30),
             )
         )
         session.add(
@@ -711,6 +936,10 @@ async def test_holder_breadth_direction_positive_and_negative(ctx) -> None:
 
     assert positive.holder_breadth_score == 20
     assert positive.direction == scoring.POSITIVE
+    positive_evidence = json.loads(positive.evidence_json)
+    assert positive_evidence["primary_signal"] == "holder_breadth"
+    assert positive_evidence["primary_direction"] == scoring.POSITIVE
+    assert "持币人数增加｜Positive｜ATT" in format_attention_alert(positive)
     with session_scope(session_factory) as session:
         session.query(TokenIntelligenceSnapshot).delete()
         session.add(
@@ -722,7 +951,7 @@ async def test_holder_breadth_direction_positive_and_negative(ctx) -> None:
                 market_cap_usd=Decimal("1000000"),
                 liquidity_usd=Decimal("100000"),
                 holder_count=5000,
-                observed_at=now - timedelta(minutes=60),
+                observed_at=now - timedelta(minutes=30),
             )
         )
         session.add(
@@ -742,6 +971,10 @@ async def test_holder_breadth_direction_positive_and_negative(ctx) -> None:
 
     assert negative.holder_breadth_score == 20
     assert negative.direction == scoring.NEGATIVE
+    negative_evidence = json.loads(negative.evidence_json)
+    assert negative_evidence["primary_signal"] == "holder_breadth"
+    assert negative_evidence["primary_direction"] == scoring.NEGATIVE
+    assert "持币人数减少｜Negative｜ATT" in format_attention_alert(negative)
 
 
 def test_token_snapshot_baseline_is_relative_to_latest_snapshot(ctx) -> None:
@@ -759,7 +992,7 @@ def test_token_snapshot_baseline_is_relative_to_latest_snapshot(ctx) -> None:
             market_cap_usd=Decimal("1000000"),
             liquidity_usd=Decimal("100000"),
             holder_count=500,
-            observed_at=now - timedelta(minutes=80),
+            observed_at=now - timedelta(minutes=50),
         )
         latest = TokenIntelligenceSnapshot(
             wallet_id=wallet_id,
@@ -797,7 +1030,7 @@ async def test_holder_family_direction_mixed_for_breadth_and_top_reduction(ctx) 
                 market_cap_usd=Decimal("1000000"),
                 liquidity_usd=Decimal("100000"),
                 holder_count=500,
-                observed_at=now - timedelta(minutes=60),
+                observed_at=now - timedelta(minutes=30),
             )
         )
         session.add(
@@ -822,6 +1055,1370 @@ async def test_holder_family_direction_mixed_for_breadth_and_top_reduction(ctx) 
     assert assessment.top_holder_score == 25
     assert assessment.holder_family_score == 25
     assert assessment.direction == scoring.MIXED
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["primary_signal"] == "top_holder_reduction"
+    assert evidence["primary_direction"] == scoring.NEGATIVE
+    assert "重要大户减仓｜Mixed｜ATT" in format_attention_alert(assessment)
+    assert "筹码集中" not in format_attention_alert(assessment)
+    assert "筹码分散" not in format_attention_alert(assessment)
+
+
+@pytest.mark.asyncio
+async def test_holder_breadth_uses_30m_baseline_not_60m(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now - timedelta(minutes=60),
+            )
+        )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=950,
+                observed_at=now - timedelta(minutes=30),
+            )
+        )
+        latest = TokenIntelligenceSnapshot(
+            wallet_id=wallet_id,
+            chain="robinhood",
+            token_address=TOKEN,
+            symbol="WINK",
+            market_cap_usd=Decimal("1000000"),
+            liquidity_usd=Decimal("100000"),
+            holder_count=1000,
+            observed_at=now,
+        )
+        session.add(latest)
+        session.flush()
+        service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+        score, direction = service._holder_breadth(session, wallet_id, TOKEN, latest)
+        fact = service._holder_count_fact(session, wallet_id, TOKEN, latest)
+
+    assert score == 0
+    assert direction == scoring.NEUTRAL
+    assert fact is not None
+    assert fact.window_minutes == 30
+    assert fact.baseline_count == 950
+
+
+@pytest.mark.asyncio
+async def test_holder_count_display_fact_omitted_without_30m_baseline(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now - timedelta(minutes=60),
+            )
+        )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=1000,
+                observed_at=now,
+            )
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.holder_breadth_score == 0
+    assert "holder_count" not in evidence["display_facts"]
+
+
+@pytest.mark.parametrize(
+    ("baseline", "current", "expected"),
+    [
+        (500, 542, "+8.4%"),
+        (500, 450, "-10%"),
+        (500, 500, "0%"),
+    ],
+)
+def test_holder_count_display_fact_formats_percent(ctx, baseline: int, current: int, expected: str) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=baseline,
+                observed_at=now - timedelta(minutes=30),
+            )
+        )
+        latest = TokenIntelligenceSnapshot(
+            wallet_id=wallet_id,
+            chain="robinhood",
+            token_address=TOKEN,
+            symbol="WINK",
+            market_cap_usd=Decimal("1000000"),
+            liquidity_usd=Decimal("100000"),
+            holder_count=current,
+            observed_at=now,
+        )
+        session.add(latest)
+        session.flush()
+        service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+        display_facts = service._display_facts(session, wallet_id, TOKEN, None, latest, 0, None, None, None)
+
+    text = format_attention_alert(
+        make_alert_assessment(evidence={"display_facts": {"holder_count": display_facts["holder_count"]}})
+    )
+    assert f"• 持仓人数｜30m {expected}" in text
+
+
+def test_top10_display_fact_uses_aggregate_share_and_actual_window(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    now = utc_now()
+    previous = now - timedelta(minutes=15)
+    with session_scope(session_factory) as session:
+        for index in range(10):
+            session.add(
+                TopHolderSnapshot(
+                    wallet_id=wallet_id,
+                    chain="robinhood",
+                    token_address=TOKEN,
+                    symbol="WINK",
+                    holder_address=f"0xold{index}",
+                    balance=Decimal("100"),
+                    hold_percentage=Decimal("0.042"),
+                    usd_value=None,
+                    dropped_out_top20=False,
+                    observed_at=previous,
+                )
+            )
+        for index in range(10):
+            session.add(
+                TopHolderSnapshot(
+                    wallet_id=wallet_id,
+                    chain="robinhood",
+                    token_address=TOKEN,
+                    symbol="WINK",
+                    holder_address=f"0xnew{index}",
+                    balance=Decimal("100"),
+                    hold_percentage=Decimal("0.0307"),
+                    usd_value=None,
+                    dropped_out_top20=False,
+                    observed_at=now,
+                )
+            )
+        session.add(
+            TopHolderSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                holder_address="0xdropped",
+                balance=None,
+                hold_percentage=Decimal("0.99"),
+                usd_value=None,
+                dropped_out_top20=True,
+                observed_at=now,
+            )
+        )
+        session.flush()
+        watch_started_at = service._watch_started_at(session, wallet_id, TOKEN)
+        fact = service._top10_fact(session, wallet_id, TOKEN, watch_started_at)
+
+    assert fact is not None
+    assert fact["window_minutes"] == 15
+    assert Decimal(str(fact["baseline_share"])) == Decimal("0.420")
+    assert Decimal(str(fact["current_share"])) == Decimal("0.3070")
+    assert Decimal(str(fact["change_pct"])).quantize(Decimal("0.1")) == Decimal("-26.9")
+
+
+def test_top10_display_fact_does_not_cross_watch_sessions(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    with session_scope(session_factory) as session:
+        session.query(TokenWatchState).delete()
+        session.add(
+            TokenWatchState(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                active=False,
+                started_at=now - timedelta(hours=1),
+                last_seen_at=now - timedelta(minutes=20),
+                ended_at=now - timedelta(minutes=20),
+            )
+        )
+        for index in range(10):
+            session.add(
+                TopHolderSnapshot(
+                    wallet_id=wallet_id,
+                    chain="robinhood",
+                    token_address=TOKEN,
+                    symbol="WINK",
+                    holder_address=f"0xold{index}",
+                    balance=Decimal("100"),
+                    hold_percentage=Decimal("0.05"),
+                    usd_value=None,
+                    dropped_out_top20=False,
+                    observed_at=now - timedelta(minutes=30),
+                )
+            )
+        session.add(
+            TokenWatchState(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                active=True,
+                started_at=now - timedelta(minutes=1),
+                last_seen_at=now,
+            )
+        )
+        watch_started_at = service._watch_started_at(session, wallet_id, TOKEN)
+        fact = service._top10_fact(session, wallet_id, TOKEN, watch_started_at)
+
+    assert fact is None
+
+
+@pytest.mark.parametrize(
+    ("window_minutes", "previous_each", "current_each", "expected"),
+    [
+        (15, "0.0500", "0.0495", False),  # -1%
+        (16, "0.0500", "0.04865", False),  # -2.7%
+        (15, "0.0500", "0.05495", False),  # +9.9%
+        (15, "0.0500", "0.0550", True),  # +10%
+        (15, "0.0500", "0.0450", True),  # -10%
+        (60, "0.0500", "0.0600", True),
+        (61, "0.0500", "0.0600", False),
+        (1609, "0.0500", "0.0350", False),
+    ],
+)
+def test_top10_display_fact_requires_meaningful_fresh_change(
+    ctx,
+    window_minutes: int,
+    previous_each: str,
+    current_each: str,
+    expected: bool,
+) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=1700))
+    add_top10_group(
+        session_factory,
+        wallet_id,
+        observed_at=now - timedelta(minutes=window_minutes),
+        share_each=previous_each,
+        prefix=f"old{window_minutes}",
+    )
+    add_top10_group(
+        session_factory,
+        wallet_id,
+        observed_at=now,
+        share_each=current_each,
+        prefix=f"new{window_minutes}",
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        watch_started_at = service._watch_started_at(session, wallet_id, TOKEN)
+        fact = service._top10_fact(session, wallet_id, TOKEN, watch_started_at)
+
+    assert (fact is not None) is expected
+
+
+def test_invalid_top10_fact_does_not_enter_display_or_position_intelligence(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=30))
+    add_top10_group(session_factory, wallet_id, observed_at=now - timedelta(minutes=15), share_each="0.0500", prefix="old")
+    add_top10_group(session_factory, wallet_id, observed_at=now, share_each="0.0495", prefix="new")
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        watch_started_at = service._watch_started_at(session, wallet_id, TOKEN)
+        assert service._top10_fact(session, wallet_id, TOKEN, watch_started_at) is None
+        facts = service._display_facts(session, wallet_id, TOKEN, None, None, 0, None, None, watch_started_at)
+
+    assert "top10" not in facts
+    result = build_position_intelligence(position_scores(), facts)
+    assert "top10" not in result.positive_drivers
+    assert "top10" not in result.negative_drivers
+
+
+@pytest.mark.parametrize(
+    ("minutes", "expected"),
+    [(5, "5m"), (15, "15m"), (30, "30m"), (60, "1h"), (120, "2h"), (135, "2h15m")],
+)
+def test_format_window(minutes: int, expected: str) -> None:
+    assert _format_window(minutes) == expected
+
+
+def test_feed_display_fact_net_wallets_and_usd_can_disagree(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    for index in range(10):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            direction=scoring.POSITIVE,
+            wallet=f"0xbuy{index}",
+            usd="200",
+            event_at=now,
+        )
+    for index in range(2):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            direction=scoring.NEGATIVE,
+            wallet=f"0xsell{index}",
+            usd="7000",
+            event_at=now,
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        fact = service._feed_family_fact(session, wallet_id, TOKEN, scoring.SMART_MONEY)
+
+    assert fact is not None
+    assert fact.net_directional_wallets == 8
+    assert fact.net_usd == Decimal("-12000")
+    text = format_attention_alert(
+        make_alert_assessment(evidence={"display_facts": {"smart_money": _test_feed_fact_dict(fact)}})
+    )
+    assert "• 聪明钱｜15m +8钱包 -$12k" in text
+
+
+def test_feed_display_fact_omits_usd_when_incomplete(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    add_intelligence_event(session_factory, wallet_id, direction=scoring.POSITIVE, wallet="0xbuy1", usd="1000", event_at=now)
+    add_intelligence_event(session_factory, wallet_id, direction=scoring.POSITIVE, wallet="0xbuy2", usd=None, event_at=now)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        fact = service._feed_family_fact(session, wallet_id, TOKEN, scoring.SMART_MONEY)
+
+    assert fact is not None
+    assert fact.usd_complete is False
+    text = format_attention_alert(
+        make_alert_assessment(evidence={"display_facts": {"smart_money": _test_feed_fact_dict(fact)}})
+    )
+    assert "• 聪明钱｜15m +2钱包" in text
+    assert "$" not in text.split("• 聪明钱｜15m +2钱包", 1)[1].splitlines()[0]
+
+
+def test_kol_display_fact_net_wallets_and_usd(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    for index in range(3):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            family=scoring.KOL,
+            source="gmgn_kol",
+            direction=scoring.POSITIVE,
+            wallet=f"0xkolbuy{index}",
+            usd="1000",
+            event_at=now,
+        )
+    add_intelligence_event(
+        session_factory,
+        wallet_id,
+        family=scoring.KOL,
+        source="gmgn_kol",
+        direction=scoring.NEGATIVE,
+        wallet="0xkolsell",
+        usd="1800",
+        event_at=now,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        fact = service._feed_family_fact(session, wallet_id, TOKEN, scoring.KOL)
+
+    assert fact is not None
+    assert fact.net_directional_wallets == 2
+    assert fact.net_usd == Decimal("1200")
+    text = format_attention_alert(
+        make_alert_assessment(evidence={"display_facts": {"kol": _test_feed_fact_dict(fact)}})
+    )
+    assert "• KOL｜15m +2钱包 +$1.2k" in text
+
+
+@pytest.mark.asyncio
+async def test_kol_primary_display_direction_uses_negative_net_usd_when_scoring_mixed(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    for index in range(3):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            family=scoring.KOL,
+            source="gmgn_kol",
+            direction=scoring.POSITIVE,
+            wallet=f"0xkolbuy{index}",
+            usd="100",
+            event_at=now,
+        )
+    for index in range(6):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            family=scoring.KOL,
+            source="gmgn_kol",
+            direction=scoring.NEGATIVE,
+            wallet=f"0xkolsell{index}",
+            usd="316.666666666666666667",
+            event_at=now,
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.primary_family == scoring.KOL
+    assert assessment.kol_score == 35
+    assert assessment.direction == scoring.MIXED
+    assert assessment.final_attention_score == 45
+    assert evidence["primary_direction"] == scoring.NEGATIVE
+    assert evidence["position_intelligence"]["label"] == NO_CLEAR_CHANGE
+    assert "KOL资金流出｜Mixed｜ATT 45" in format_attention_alert(assessment)
+    assert "KOL资金异动｜Mixed｜ATT 45" not in format_attention_alert(assessment)
+
+
+@pytest.mark.asyncio
+async def test_kol_primary_display_direction_uses_positive_net_usd_when_scoring_mixed(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    for index in range(6):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            family=scoring.KOL,
+            source="gmgn_kol",
+            direction=scoring.POSITIVE,
+            wallet=f"0xkolbuy{index}",
+            usd="500",
+            event_at=now,
+        )
+    for index in range(3):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            family=scoring.KOL,
+            source="gmgn_kol",
+            direction=scoring.NEGATIVE,
+            wallet=f"0xkolsell{index}",
+            usd="466.666666666666666667",
+            event_at=now,
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.primary_family == scoring.KOL
+    assert assessment.kol_score == 35
+    assert assessment.direction == scoring.MIXED
+    assert evidence["primary_direction"] == scoring.POSITIVE
+    assert "KOL资金流入｜Mixed｜ATT 45" in format_attention_alert(assessment)
+
+
+@pytest.mark.asyncio
+async def test_kol_primary_display_direction_prefers_usd_over_wallet_count(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    for index in range(11):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            family=scoring.KOL,
+            source="gmgn_kol",
+            direction=scoring.POSITIVE,
+            wallet=f"0xkolbuy{index}",
+            usd="100",
+            event_at=now,
+        )
+    for index in range(3):
+        add_intelligence_event(
+            session_factory,
+            wallet_id,
+            family=scoring.KOL,
+            source="gmgn_kol",
+            direction=scoring.NEGATIVE,
+            wallet=f"0xkolsell{index}",
+            usd="4366.666666666666666667",
+            event_at=now,
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.kol_score == 35
+    assert assessment.direction == scoring.MIXED
+    assert evidence["display_facts"]["kol"]["net_wallets"] == 8
+    assert Decimal(evidence["display_facts"]["kol"]["net_usd"]) < 0
+    assert evidence["primary_direction"] == scoring.NEGATIVE
+    assert "KOL资金流出｜Mixed｜ATT 45" in format_attention_alert(assessment)
+
+
+def test_feed_primary_display_direction_uses_wallets_when_usd_incomplete() -> None:
+    negative = FeedFamilyFact(
+        family=scoring.KOL,
+        score=35,
+        direction=scoring.MIXED,
+        window_minutes=15,
+        buy_wallets=3,
+        sell_wallets=6,
+        net_directional_wallets=-3,
+        buy_usd=None,
+        sell_usd=None,
+        net_usd=None,
+        usd_complete=False,
+        buy_activity_count=3,
+        sell_activity_count=6,
+    )
+    positive = FeedFamilyFact(
+        family=scoring.KOL,
+        score=35,
+        direction=scoring.MIXED,
+        window_minutes=15,
+        buy_wallets=6,
+        sell_wallets=3,
+        net_directional_wallets=3,
+        buy_usd=None,
+        sell_usd=None,
+        net_usd=None,
+        usd_complete=False,
+        buy_activity_count=6,
+        sell_activity_count=3,
+    )
+
+    assert _feed_primary_display_direction(negative, scoring.MIXED) == scoring.NEGATIVE
+    assert _feed_primary_display_direction(positive, scoring.MIXED) == scoring.POSITIVE
+
+
+def test_feed_primary_display_direction_falls_back_when_net_zero() -> None:
+    fact = FeedFamilyFact(
+        family=scoring.KOL,
+        score=35,
+        direction=scoring.MIXED,
+        window_minutes=15,
+        buy_wallets=3,
+        sell_wallets=3,
+        net_directional_wallets=0,
+        buy_usd=Decimal("1000"),
+        sell_usd=Decimal("1000"),
+        net_usd=Decimal("0"),
+        usd_complete=True,
+        buy_activity_count=3,
+        sell_activity_count=3,
+    )
+
+    assert _feed_primary_display_direction(fact, scoring.MIXED) == scoring.MIXED
+    assert format_directional_trigger_title(scoring.KOL, scoring.MIXED, None, None) == "KOL资金异动"
+
+
+def test_smart_money_primary_display_direction_uses_same_usd_first_rule() -> None:
+    fact = FeedFamilyFact(
+        family=scoring.SMART_MONEY,
+        score=35,
+        direction=scoring.MIXED,
+        window_minutes=15,
+        buy_wallets=8,
+        sell_wallets=2,
+        net_directional_wallets=6,
+        buy_usd=Decimal("1000"),
+        sell_usd=Decimal("13000"),
+        net_usd=Decimal("-12000"),
+        usd_complete=True,
+        buy_activity_count=8,
+        sell_activity_count=2,
+    )
+
+    assert _feed_primary_display_direction(fact, scoring.MIXED) == scoring.NEGATIVE
+    assert format_directional_trigger_title(scoring.SMART_MONEY, scoring.NEGATIVE, None, None) == "聪明钱流出"
+
+
+def test_liquidity_display_fact_uses_1h_baseline(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now - timedelta(minutes=60),
+            )
+        )
+        latest = TokenIntelligenceSnapshot(
+            wallet_id=wallet_id,
+            chain="robinhood",
+            token_address=TOKEN,
+            symbol="WINK",
+            market_cap_usd=Decimal("1000000"),
+            liquidity_usd=Decimal("96800"),
+            holder_count=500,
+            observed_at=now,
+        )
+        session.add(latest)
+        session.flush()
+        service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+        fact = service._liquidity_fact(session, wallet_id, TOKEN, latest)
+
+    assert fact is not None
+    assert fact.window_minutes == 60
+    assert fact.change_pct == Decimal("-3.200")
+
+
+@pytest.mark.asyncio
+async def test_liquidity_display_fact_omitted_without_1h_baseline(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("96800"),
+                holder_count=500,
+                observed_at=now,
+            )
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert "liquidity" not in evidence["display_facts"]
+
+
+@pytest.mark.asyncio
+async def test_price_display_uses_scored_5m_window(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(PriceSnapshot).delete()
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1"),
+                balance=Decimal("50"),
+                usd_value=Decimal("50"),
+                observed_at=now - timedelta(minutes=5),
+            )
+        )
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1.3"),
+                balance=Decimal("50"),
+                usd_value=Decimal("65"),
+                observed_at=now,
+            )
+        )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now,
+            )
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.price_score == 40
+    assert evidence["display_facts"]["price"]["window_minutes"] == 5
+    assert "• 价格｜5m +30%" in format_attention_alert(assessment)
+
+
+@pytest.mark.asyncio
+async def test_price_display_uses_scored_15m_window(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(PriceSnapshot).delete()
+        session.query(TokenIntelligenceSnapshot).delete()
+        for minutes, price in ((15, "1"), (5, "1.26"), (0, "1.3")):
+            session.add(
+                PriceSnapshot(
+                    wallet_id=wallet_id,
+                    chain="robinhood",
+                    token_address=TOKEN,
+                    symbol="WINK",
+                    price_usd=Decimal(price),
+                    balance=Decimal("50"),
+                    usd_value=Decimal("65"),
+                    observed_at=now - timedelta(minutes=minutes),
+                )
+            )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now,
+            )
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.price_score == 40
+    assert evidence["display_facts"]["price"]["window_minutes"] == 15
+    assert "• 价格｜15m +30%" in format_attention_alert(assessment)
+
+
+@pytest.mark.asyncio
+async def test_price_display_context_does_not_change_zero_price_score(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(PriceSnapshot).delete()
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1"),
+                balance=Decimal("50"),
+                usd_value=Decimal("50"),
+                observed_at=now - timedelta(minutes=5),
+            )
+        )
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1.02"),
+                balance=Decimal("50"),
+                usd_value=Decimal("51"),
+                observed_at=now,
+            )
+        )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now,
+            )
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.price_score == 0
+    assert evidence["display_facts"]["price"]["window_minutes"] == 5
+    assert "• 价格｜5m +2%" in format_attention_alert(assessment)
+
+
+@pytest.mark.parametrize("quality_status", [PRICE_QUALITY_PENDING, PRICE_QUALITY_OUTLIER])
+def test_pending_or_outlier_price_snapshot_cannot_be_price_baseline(ctx, quality_status: str) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    watch_started_at = now - timedelta(minutes=10)
+    start_watch_session(session_factory, wallet_id, started_at=watch_started_at)
+    add_price_snapshot(
+        session_factory,
+        wallet_id,
+        price="1",
+        usd_value="50",
+        observed_at=now - timedelta(minutes=5),
+        quality_status=quality_status,
+    )
+    add_price_snapshot(
+        session_factory,
+        wallet_id,
+        price="1.9",
+        usd_value="95",
+        observed_at=now,
+        quality_status=PRICE_QUALITY_VALID,
+    )
+    add_token_intel(session_factory, wallet_id, market_cap="1000000", liquidity="100000", observed_at=now)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        latest_intel = service._latest_token_snapshot(session, wallet_id, TOKEN, watch_started_at)
+        price_score, direction, change, window = service._price_family(
+            session,
+            wallet_id,
+            TOKEN,
+            latest_intel,
+            watch_started_at,
+        )
+        baseline = service._baseline_price_snapshot(session, wallet_id, TOKEN, now, 5, watch_started_at)
+
+    assert baseline is None
+    assert price_score == 0
+    assert direction == scoring.NEUTRAL
+    assert change is None
+    assert window is None
+
+
+def test_pending_and_outlier_price_snapshots_do_not_enter_historical_abnormality(ctx, monkeypatch) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    watch_started_at = now - timedelta(hours=2)
+    start_watch_session(session_factory, wallet_id, started_at=watch_started_at)
+    add_price_snapshot(session_factory, wallet_id, price="1", observed_at=now - timedelta(minutes=55))
+    add_price_snapshot(
+        session_factory,
+        wallet_id,
+        price="2",
+        observed_at=now - timedelta(minutes=50),
+        quality_status=PRICE_QUALITY_PENDING,
+    )
+    add_price_snapshot(session_factory, wallet_id, price="1", observed_at=now - timedelta(minutes=35))
+    add_price_snapshot(
+        session_factory,
+        wallet_id,
+        price="2",
+        observed_at=now - timedelta(minutes=30),
+        quality_status=PRICE_QUALITY_OUTLIER,
+    )
+    add_price_snapshot(session_factory, wallet_id, price="1.2", observed_at=now, quality_status=PRICE_QUALITY_VALID)
+    captured: dict[str, list[Decimal]] = {}
+
+    def capture_abnormality(current_abs_change, historical_abs_changes):
+        captured["changes"] = historical_abs_changes
+        return 5
+
+    monkeypatch.setattr(scoring, "abnormality_score", capture_abnormality)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        result = service._abnormality(session, wallet_id, TOKEN, Decimal("20"), 5, watch_started_at)
+
+    assert result == 5
+    assert captured["changes"] == []
+
+
+@pytest.mark.asyncio
+async def test_ai_single_snapshot_outlier_does_not_create_false_price_attention(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    watch_started_at = now - timedelta(minutes=20)
+    start_watch_session(session_factory, wallet_id, token=TOKEN, symbol="AI", started_at=watch_started_at)
+    add_token_intel(
+        session_factory,
+        wallet_id,
+        token=TOKEN,
+        symbol="AI",
+        market_cap="227000000",
+        liquidity="4210000",
+        observed_at=now,
+    )
+    for minutes, price, status in (
+        (5, "0.22786337", PRICE_QUALITY_VALID),
+        (4, "0.23056119", PRICE_QUALITY_VALID),
+        (3, "0.43582597", PRICE_QUALITY_OUTLIER),
+        (2, "0.23464219", PRICE_QUALITY_VALID),
+        (1, "0.23484438", PRICE_QUALITY_VALID),
+    ):
+        add_price_snapshot(
+            session_factory,
+            wallet_id,
+            token=TOKEN,
+            symbol="AI",
+            price=price,
+            usd_value="38",
+            observed_at=now - timedelta(minutes=minutes),
+            quality_status=status,
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.handle_price_snapshot_update(wallet_id, TOKEN)
+
+    assert assessment is None
+    with session_scope(session_factory) as session:
+        latest = service._latest_price_snapshot(session, wallet_id, TOKEN, watch_started_at)
+        previous = service._previous_price_snapshot(session, wallet_id, TOKEN, watch_started_at, latest.observed_at)
+        latest_intel = service._latest_token_snapshot(session, wallet_id, TOKEN, watch_started_at)
+        price_score, direction, change, window = service._price_family(
+            session,
+            wallet_id,
+            TOKEN,
+            latest_intel,
+            watch_started_at,
+        )
+
+    assert Decimal(str(latest.price_usd)).quantize(Decimal("0.00000001")) == Decimal("0.23484438")
+    assert Decimal(str(previous.price_usd)).quantize(Decimal("0.00000001")) == Decimal("0.23464219")
+    assert price_score == 0
+    assert direction == scoring.NEUTRAL
+    assert change is None
+    assert window is None
+
+
+def test_format_compact_usd() -> None:
+    assert format_compact_usd(Decimal("420")) == "$420"
+    assert format_compact_usd(Decimal("4820"), signed=True) == "+$4.8k"
+    assert format_compact_usd(Decimal("-12340"), signed=True) == "-$12.3k"
+    assert format_compact_usd(Decimal("1250000"), signed=True) == "+$1.25m"
+
+
+def test_position_intelligence_structural_deterioration_price_holder_smart() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, holder=10, smart=25),
+        position_facts(price="-32", holder="-18", smart_wallets=-3, smart_usd="-8000"),
+    )
+
+    assert result.label == STRUCTURAL_DETERIORATION
+    assert result.label_cn == "结构性恶化"
+    assert result.summary == "价格下跌且持仓人数、资金流同步走弱，结构性风险上升。"
+
+
+def test_position_intelligence_structural_deterioration_top10_liquidity() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, liquidity=25),
+        position_facts(price="-28", top10="22", liquidity="-31"),
+    )
+
+    assert result.label == STRUCTURAL_DETERIORATION
+    assert result.summary == "价格走弱，同时筹码集中度提高、流动性下降，结构性恶化。"
+
+
+def test_position_intelligence_market_expansion_holder_smart() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, holder=10, smart=25),
+        position_facts(price="28", holder="24", smart_wallets=4, smart_usd="11000"),
+    )
+
+    assert result.label == MARKET_EXPANSION
+    assert result.summary == "价格走强，持仓人数与资金流同步改善，市场扩散增强。"
+
+
+def test_position_intelligence_market_expansion_top10_liquidity() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, holder=10),
+        position_facts(price="32", holder="18", top10="-15", liquidity="17"),
+    )
+
+    assert result.label == MARKET_EXPANSION
+    assert result.summary == "价格上涨同时筹码趋于分散，市场扩散结构增强。"
+
+
+def test_position_intelligence_minority_driven_top10_holder_neutral() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40),
+        position_facts(price="50", top10="35", holder="0"),
+    )
+
+    assert result.label == MINORITY_DRIVEN
+    assert result.summary == "价格上涨但筹码趋于集中，市场扩散有限，偏少数资金推动。"
+
+
+def test_position_intelligence_minority_driven_smart_outflow() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, smart=25),
+        position_facts(price="35", top10="20", smart_wallets=-4, smart_usd="-7000"),
+    )
+
+    assert result.label == MINORITY_DRIVEN
+    assert result.summary == "价格上涨但筹码趋于集中，聪明钱净流出，偏少数资金推动。"
+
+
+def test_position_intelligence_smart_inflow_without_top10_not_minority_driven() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, smart=25),
+        position_facts(price="35", top10="0", smart_wallets=3, smart_usd="7000"),
+    )
+
+    assert result.label == NO_CLEAR_CHANGE
+
+
+def test_position_intelligence_support_emerging() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, smart=25),
+        position_facts(price="-25", smart_wallets=4, smart_usd="6000", liquidity="0"),
+    )
+
+    assert result.label == SUPPORT_EMERGING
+    assert result.summary == "价格回落，但聪明钱出现净流入，短线存在承接。"
+
+
+def test_position_intelligence_structural_priority_over_support() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, holder=10, smart=25, liquidity=25),
+        position_facts(price="-25", holder="-20", smart_wallets=4, smart_usd="6000", liquidity="-31"),
+    )
+
+    assert result.label == STRUCTURAL_DETERIORATION
+
+
+def test_position_intelligence_signal_divergence_price_holder_smart() -> None:
+    result = build_position_intelligence(
+        position_scores(price=40, holder=10, smart=25),
+        position_facts(price="25", holder="15", smart_wallets=-4, smart_usd="-8000"),
+    )
+
+    assert result.label == SIGNAL_DIVERGENCE
+    assert result.summary == "价格上涨，但聪明钱净流出，当前价格与资金信号分化。"
+
+
+def test_position_intelligence_signal_divergence_holder_top10() -> None:
+    result = build_position_intelligence(
+        position_scores(holder=10),
+        position_facts(holder="15", top10="20"),
+    )
+
+    assert result.label == SIGNAL_DIVERGENCE
+    assert result.summary == "持仓人数增长，但筹码集中度提高，结构信号分化。"
+
+
+def test_position_intelligence_no_clear_change_only_price_or_no_data() -> None:
+    price_only = build_position_intelligence(position_scores(price=40), position_facts(price="25"))
+    no_data = build_position_intelligence(position_scores(), {})
+
+    assert price_only.label == NO_CLEAR_CHANGE
+    assert price_only.summary == "当前主要是价格异动，暂未看到明显结构共振。"
+    assert no_data.label == NO_CLEAR_CHANGE
+    assert no_data.summary == "当前有效结构信号有限，暂未看到明显共振。"
+
+
+@pytest.mark.parametrize(
+    ("change", "positive", "negative", "neutral"),
+    [
+        ("9.9", [], [], ["top10"]),
+        ("10", [], ["top10"], []),
+        ("-10", ["top10"], [], []),
+    ],
+)
+def test_position_intelligence_top10_threshold(change: str, positive: list[str], negative: list[str], neutral: list[str]) -> None:
+    result = build_position_intelligence(position_scores(), position_facts(top10=change))
+
+    assert result.positive_drivers == positive
+    assert result.negative_drivers == negative
+    assert result.neutral_drivers == neutral
+
+
+@pytest.mark.asyncio
+async def test_position_intelligence_is_frozen_in_assessment_evidence(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        session.query(PriceSnapshot).delete()
+        session.query(TokenIntelligenceSnapshot).delete()
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1"),
+                balance=Decimal("50"),
+                usd_value=Decimal("50"),
+                observed_at=now - timedelta(minutes=5),
+            )
+        )
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1.3"),
+                balance=Decimal("50"),
+                usd_value=Decimal("65"),
+                observed_at=now,
+            )
+        )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now,
+            )
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert evidence["position_intelligence"]["label"] == NO_CLEAR_CHANGE
+    assert evidence["position_intelligence"]["summary"] == "当前主要是价格异动，暂未看到明显结构共振。"
+    assert evidence["primary_family"] == scoring.PRICE
+    assert evidence["primary_direction"] == scoring.POSITIVE
+    assert evidence["primary_signal"] is None
+
+
+@pytest.mark.asyncio
+async def test_top_holder_reduction_assessment_freezes_primary_signal(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    started_at = now - timedelta(minutes=10)
+    start_watch_session(session_factory, wallet_id, started_at=started_at)
+    holder = "0x0000000000000000000000000000000000000abc"
+    with session_scope(session_factory) as session:
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1"),
+                balance=Decimal("50"),
+                usd_value=Decimal("50"),
+                observed_at=now,
+            )
+        )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now,
+            )
+        )
+        session.add(
+            TopHolderPeak(
+                wallet_id=wallet_id,
+                token_address=TOKEN,
+                holder_address=holder,
+                peak_balance=Decimal("1000"),
+                peak_hold_percentage=Decimal("0.02"),
+                watch_started_at=started_at,
+            )
+        )
+        session.add(
+            TopHolderSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                holder_address=holder,
+                balance=Decimal("650"),
+                hold_percentage=Decimal("0.013"),
+                observed_at=now,
+            )
+        )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.primary_family == scoring.HOLDER
+    assert evidence["primary_direction"] == scoring.NEGATIVE
+    assert evidence["primary_signal"] == "top_holder_reduction"
+    text = format_attention_alert(assessment)
+    assert "重要大户减仓｜Negative｜ATT" in text
+    assert "筹码集中" not in text
+    assert "筹码分散" not in text
+
+
+@pytest.mark.asyncio
+async def test_holder_cluster_reduction_assessment_freezes_primary_signal(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    started_at = now - timedelta(minutes=10)
+    start_watch_session(session_factory, wallet_id, started_at=started_at)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    with session_scope(session_factory) as session:
+        session.add(
+            PriceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                price_usd=Decimal("1"),
+                balance=Decimal("50"),
+                usd_value=Decimal("50"),
+                observed_at=now,
+            )
+        )
+        session.add(
+            TokenIntelligenceSnapshot(
+                wallet_id=wallet_id,
+                chain="robinhood",
+                token_address=TOKEN,
+                symbol="WINK",
+                market_cap_usd=Decimal("1000000"),
+                liquidity_usd=Decimal("100000"),
+                holder_count=500,
+                observed_at=now,
+            )
+        )
+        watched = service._watched_token(session, wallet_id, TOKEN)
+    service._save_top_holder_snapshots(
+        watched,
+        [
+            holder("0xholder1", "1000", "0.05"),
+            holder("0xholder2", "900", "0.04"),
+            holder("0xholder3", "800", "0.03"),
+        ],
+    )
+    service._save_top_holder_snapshots(
+        watched,
+        [
+            holder("0xholder1", "750", "0.04"),
+            holder("0xholder2", "675", "0.03"),
+            holder("0xholder3", "600", "0.02"),
+        ],
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+    evidence = json.loads(assessment.evidence_json)
+
+    assert assessment.primary_family == scoring.HOLDER
+    assert assessment.top_holder_score == 15
+    assert assessment.holder_cluster_score == 30
+    assert assessment.holder_family_score == 30
+    assert assessment.direction == scoring.NEGATIVE
+    assert evidence["primary_signal"] == "holder_cluster_reduction"
+    assert evidence["primary_direction"] == scoring.NEGATIVE
+    text = format_attention_alert(assessment)
+    assert "多名大户减仓｜Negative｜ATT" in text
+    assert "筹码集中" not in text
+
+
+def test_format_attention_alert_uses_frozen_position_intelligence() -> None:
+    text = format_attention_alert(
+        make_alert_assessment(
+            evidence={
+                "display_facts": {"price": {"window_minutes": 5, "change_pct": "32.6"}},
+                "position_intelligence": {
+                    "label": MINORITY_DRIVEN,
+                    "label_cn": "少数资金推动",
+                    "summary": "固定判断，不重新读取数据库。",
+                    "positive_drivers": ["price"],
+                    "negative_drivers": ["top10"],
+                    "neutral_drivers": [],
+                },
+            }
+        )
+    )
+
+    assert "判断：固定判断，不重新读取数据库。" in text
+    assert "label_cn" not in text
+    assert "少数资金推动：" not in text
+
+
+def test_position_intelligence_does_not_change_assessment_scoring_fields() -> None:
+    assessment = make_alert_assessment(final_score=72, direction=scoring.MIXED)
+    before = (
+        assessment.final_attention_score,
+        assessment.should_notify,
+        assessment.direction,
+        assessment.primary_family,
+        assessment.price_score,
+        assessment.holder_family_score,
+        assessment.smart_money_score,
+        assessment.kol_score,
+        assessment.liquidity_score,
+    )
+
+    text = format_attention_alert(assessment)
+    after = (
+        assessment.final_attention_score,
+        assessment.should_notify,
+        assessment.direction,
+        assessment.primary_family,
+        assessment.price_score,
+        assessment.holder_family_score,
+        assessment.smart_money_score,
+        assessment.kol_score,
+        assessment.liquidity_score,
+    )
+
+    assert "判断：" in text
+    assert after == before
 
 
 def test_stagger_limits_due_tokens(ctx) -> None:
@@ -1679,6 +3276,424 @@ async def test_current_session_assessment_sends_and_marks(ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_token_concurrent_notifications_are_serialized_and_rechecked(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    calls = 0
+
+    async def slow_notify(chat_id: int, text: str, reply_markup=None) -> None:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        sent.append((chat_id, text))
+
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, slow_notify)
+    first = notification_assessment(wallet_id)
+    second = notification_assessment(wallet_id)
+
+    results = await asyncio.gather(service._notify_assessment(first), service._notify_assessment(second))
+
+    assert results.count(True) == 1
+    assert results.count(False) == 1
+    assert calls == 1
+    assert len(sent) == 1
+    with session_scope(session_factory) as session:
+        states = list(session.scalars(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN)))
+        assert len(states) == 1
+
+
+@pytest.mark.asyncio
+async def test_serialized_recheck_still_allows_critical_and_score_upgrade(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    warning = notification_assessment(wallet_id, final_score=55, level=scoring.WARNING, price_score=30)
+    critical = notification_assessment(wallet_id, final_score=80, level=scoring.CRITICAL, price_score=40)
+    assert await service._notify_assessment(warning) is True
+    assert await service._notify_assessment(critical) is True
+
+    with session_scope(session_factory) as session:
+        session.query(AttentionAlertState).delete()
+    sent.clear()
+
+    warning = notification_assessment(wallet_id, final_score=55, level=scoring.WARNING, price_score=30)
+    upgraded = notification_assessment(wallet_id, final_score=70, level=scoring.WARNING, price_score=30)
+    assert await service._notify_assessment(warning) is True
+    assert await service._notify_assessment(upgraded) is True
+
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_different_token_notifications_do_not_share_global_lock(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, token=TOKEN, symbol="WINK")
+    add_watched(session_factory, wallet_id, token=TOKEN_2, symbol="PONS")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    delivered: list[str] = []
+
+    async def notify_with_blocked_first(chat_id: int, text: str, reply_markup=None) -> None:
+        if "WINK" in text:
+            first_started.set()
+            await release_first.wait()
+            delivered.append("WINK")
+            return
+        delivered.append("PONS")
+
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify_with_blocked_first)
+    first = notification_assessment(wallet_id, TOKEN, symbol="WINK")
+    second = notification_assessment(wallet_id, TOKEN_2, symbol="PONS")
+
+    first_task = asyncio.create_task(service._notify_assessment(first))
+    await first_started.wait()
+    second_task = asyncio.create_task(service._notify_assessment(second))
+    await asyncio.sleep(0.05)
+
+    assert delivered == ["PONS"]
+    release_first.set()
+    assert await first_task is True
+    assert await second_task is True
+    assert delivered == ["PONS", "WINK"]
+
+
+@pytest.mark.asyncio
+async def test_failed_same_token_notification_does_not_mark_and_later_assessment_retries(monkeypatch, ctx) -> None:
+    monkeypatch.setattr(
+        "app.services.attention_engine_service.ATTENTION_NOTIFICATION_RETRY_DELAYS_SECONDS",
+        (0, 0, 0),
+    )
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    attempts = 0
+
+    async def fail_then_succeed(chat_id: int, text: str, reply_markup=None) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 3:
+            raise RuntimeError("telegram_down")
+        sent.append((chat_id, text))
+
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, fail_then_succeed)
+    first = notification_assessment(wallet_id)
+    second = notification_assessment(wallet_id)
+
+    with pytest.raises(RuntimeError, match="telegram_down"):
+        await service._notify_assessment(first)
+    with session_scope(session_factory) as session:
+        assert session.scalar(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN)) is None
+
+    assert await service._notify_assessment(second) is True
+    assert attempts == 4
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_session_assessment_waiting_for_lock_is_not_sent_or_marked(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    assessment = notification_assessment(wallet_id)
+    lock = service._notification_lock(wallet_id, TOKEN)
+    await lock.acquire()
+    try:
+        task = asyncio.create_task(service._notify_assessment(assessment))
+        await asyncio.sleep(0)
+        with session_scope(session_factory) as session:
+            state = session.scalar(
+                select(TokenWatchState).where(
+                    TokenWatchState.wallet_id == wallet_id,
+                    TokenWatchState.token_address == TOKEN,
+                    TokenWatchState.active.is_(True),
+                )
+            )
+            state.active = False
+            state.ended_at = assessment.assessed_at
+            session.add(
+                TokenWatchState(
+                    wallet_id=wallet_id,
+                    chain="robinhood",
+                    token_address=TOKEN,
+                    symbol="WINK",
+                    active=True,
+                    started_at=assessment.assessed_at + timedelta(seconds=1),
+                    last_seen_at=assessment.assessed_at + timedelta(seconds=1),
+                )
+            )
+    finally:
+        lock.release()
+
+    assert await task is False
+    assert sent == []
+    with session_scope(session_factory) as session:
+        assert session.scalar(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN)) is None
+
+
+def make_alert_assessment(
+    *,
+    symbol: str = "$ROBBIE",
+    primary_family: str | None = scoring.PRICE,
+    direction: str = scoring.MIXED,
+    final_score: int = 70,
+    level: str = scoring.WARNING,
+    token_address: str = "0xb6ec6e6e58354d956ef1a2ed6693d5c7056298d2",
+    evidence: dict[str, object] | None = None,
+    primary_direction: str = scoring.POSITIVE,
+    primary_signal: str | None = None,
+) -> AttentionAssessment:
+    evidence = evidence or {
+        "primary_direction": primary_direction,
+        "primary_signal": primary_signal,
+        "price_change_pct": "17.9",
+        "display_facts": {
+            "price": {
+                "window_minutes": 5,
+                "change_pct": "17.9",
+                "current_price": "0.01",
+                "baseline_price": "0.00848",
+            },
+            "holder_count": {
+                "window_minutes": 30,
+                "baseline_count": 500,
+                "current_count": 542,
+                "delta_count": 42,
+                "change_pct": "8.4",
+            },
+            "top10": {
+                "window_minutes": 15,
+                "baseline_share": "0.420",
+                "current_share": "0.307",
+                "change_pct": "-26.9047619",
+            },
+            "smart_money": {
+                "window_minutes": 15,
+                "buy_wallets": 8,
+                "sell_wallets": 2,
+                "net_wallets": 6,
+                "buy_usd": "10000",
+                "sell_usd": "5180",
+                "net_usd": "4820",
+                "usd_complete": True,
+            },
+            "kol": {
+                "window_minutes": 15,
+                "buy_wallets": 3,
+                "sell_wallets": 1,
+                "net_wallets": 2,
+                "buy_usd": "2200",
+                "sell_usd": "1000",
+                "net_usd": "1200",
+                "usd_complete": True,
+            },
+            "liquidity": {
+                "window_minutes": 60,
+                "baseline_usd": "100000",
+                "current_usd": "96800",
+                "change_pct": "-3.2",
+            },
+        },
+        "position_intelligence": {
+            "label": NO_CLEAR_CHANGE,
+            "label_cn": "暂无明显结构变化",
+            "summary": "当前主要是价格异动，暂未看到明显结构共振。",
+            "positive_drivers": ["price", "top10"],
+            "negative_drivers": [],
+            "neutral_drivers": ["holder_count", "liquidity"],
+        },
+    }
+    return AttentionAssessment(
+        wallet_id=1,
+        token_address=token_address,
+        symbol=symbol,
+        assessed_at=utc_now(),
+        price_score=40 if primary_family == scoring.PRICE else 0,
+        holder_family_score=25 if primary_family == scoring.HOLDER else 0,
+        smart_money_score=25 if primary_family == scoring.SMART_MONEY else 0,
+        kol_score=28 if primary_family == scoring.KOL else 0,
+        liquidity_score=35 if primary_family == scoring.LIQUIDITY else 0,
+        primary_family=primary_family,
+        primary_event_score=40,
+        final_attention_score=final_score,
+        attention_level=level,
+        direction=direction,
+        evidence_json=json.dumps(evidence),
+    )
+
+
+def test_format_attention_alert_removes_redundant_title_and_internal_level() -> None:
+    text = format_attention_alert(make_alert_assessment(level=scoring.CRITICAL))
+
+    assert "$ROBBIE 持仓异动" not in text
+    assert text.startswith("🟠 $ROBBIE\n\n价格上涨｜Mixed｜ATT 70")
+    assert "WARNING" not in text
+    assert "CRITICAL" not in text
+    assert "主要触发" not in text
+    assert "Holder Score" not in text
+    assert "Smart Money Score" not in text
+    assert "KOL Score" not in text
+    assert "Liquidity Score" not in text
+    assert "• 价格｜5m +17.9%" in text
+    assert "• 持仓人数｜30m +8.4%" in text
+    assert "• Top10｜15m -26.9%" in text
+    assert "• 聪明钱｜15m +6钱包 +$4.8k" in text
+    assert "• KOL｜15m +2钱包 +$1.2k" in text
+    assert "• 流动性｜1h -3.2%" in text
+    assert "判断：当前主要是价格异动，暂未看到明显结构共振。" in text
+    assert "暂无明显结构变化：" not in text
+    assert text.index("• 价格｜5m +17.9%") < text.index("• 流动性｜1h -3.2%")
+    assert text.index("• 流动性｜1h -3.2%") < text.index("• 持仓人数｜30m +8.4%")
+    assert text.index("• 持仓人数｜30m +8.4%") < text.index("• Top10｜15m -26.9%")
+    assert text.index("• Top10｜15m -26.9%") < text.index("• 聪明钱｜15m +6钱包 +$4.8k")
+    assert text.index("• 聪明钱｜15m +6钱包 +$4.8k") < text.index("• KOL｜15m +2钱包 +$1.2k")
+
+
+def test_format_attention_alert_orders_display_facts_and_omits_missing() -> None:
+    text = format_attention_alert(
+        make_alert_assessment(
+            evidence={
+                "display_facts": {
+                    "liquidity": {"window_minutes": 60, "change_pct": "-3.2"},
+                    "smart_money": {
+                        "window_minutes": 15,
+                        "net_wallets": 0,
+                        "net_usd": "8000",
+                        "usd_complete": True,
+                    },
+                    "price": {"window_minutes": 5, "change_pct": "4.2"},
+                    "top10": {"window_minutes": 30, "change_pct": "0"},
+                }
+            }
+        )
+    )
+
+    price_index = text.index("• 价格｜5m +4.2%")
+    liquidity_index = text.index("• 流动性｜1h -3.2%")
+    top10_index = text.index("• Top10｜30m 0%")
+    smart_index = text.index("• 聪明钱｜15m 0钱包 +$8k")
+    assert price_index < liquidity_index < top10_index < smart_index
+    assert "持仓人数" not in text
+    assert "KOL｜" not in text
+
+
+@pytest.mark.parametrize(
+    ("family", "direction", "signal", "trigger", "expected"),
+    [
+        (scoring.PRICE, scoring.POSITIVE, None, None, "价格上涨"),
+        (scoring.PRICE, scoring.NEGATIVE, None, None, "价格下跌"),
+        (scoring.HOLDER, scoring.POSITIVE, "holder_breadth", None, "持币人数增加"),
+        (scoring.HOLDER, scoring.NEGATIVE, "holder_breadth", None, "持币人数减少"),
+        (scoring.HOLDER, scoring.NEGATIVE, "top_holder_reduction", None, "重要大户减仓"),
+        (scoring.HOLDER, scoring.NEGATIVE, "holder_cluster_reduction", None, "多名大户减仓"),
+        (scoring.SMART_MONEY, scoring.POSITIVE, None, None, "聪明钱流入"),
+        (scoring.SMART_MONEY, scoring.NEGATIVE, None, None, "聪明钱流出"),
+        (scoring.KOL, scoring.POSITIVE, None, None, "KOL资金流入"),
+        (scoring.KOL, scoring.NEGATIVE, None, None, "KOL资金流出"),
+        (scoring.LIQUIDITY, scoring.POSITIVE, None, None, "流动性增加"),
+        (scoring.LIQUIDITY, scoring.NEGATIVE, None, None, "流动性减少"),
+        ("comprehensive", scoring.POSITIVE, None, None, "综合走强"),
+        ("comprehensive", scoring.NEGATIVE, None, None, "综合走弱"),
+        ("comprehensive", scoring.MIXED, None, None, "信号分化"),
+        (scoring.PRICE, scoring.NEGATIVE, None, "usd_threshold_crossing", "持仓价值跌破$5"),
+    ],
+)
+def test_format_directional_trigger_title_mappings(family, direction, signal, trigger, expected) -> None:
+    assert format_directional_trigger_title(family, direction, trigger, signal) == expected
+
+
+@pytest.mark.parametrize(
+    ("family", "signal", "expected"),
+    [
+        (scoring.PRICE, None, "价格异动"),
+        (scoring.HOLDER, "holder_breadth", "持币人数异动"),
+        (scoring.HOLDER, "holder_structure", "筹码异动"),
+        (scoring.SMART_MONEY, None, "聪明钱异动"),
+        (scoring.KOL, None, "KOL资金异动"),
+        (scoring.LIQUIDITY, None, "流动性异动"),
+        ("comprehensive", None, "综合异动"),
+    ],
+)
+def test_format_directional_trigger_title_unknown_direction_fallbacks(family, signal, expected) -> None:
+    assert format_directional_trigger_title(family, None, None, signal) == expected
+
+
+def test_format_attention_alert_uses_primary_trigger_not_overall_direction() -> None:
+    text = format_attention_alert(
+        make_alert_assessment(
+            primary_family=scoring.PRICE,
+            primary_direction=scoring.POSITIVE,
+            direction=scoring.MIXED,
+        )
+    )
+    assert "价格上涨｜Mixed｜ATT 70" in text
+    assert "信号分化｜Mixed｜ATT 70" not in text
+
+
+def test_format_attention_alert_primary_smart_not_overall_positive() -> None:
+    text = format_attention_alert(
+        make_alert_assessment(
+            primary_family=scoring.SMART_MONEY,
+            primary_direction=scoring.NEGATIVE,
+            direction=scoring.POSITIVE,
+        )
+    )
+    assert "聪明钱流出｜Positive｜ATT 70" in text
+    assert "综合走强｜Positive｜ATT 70" not in text
+
+
+def test_format_attention_alert_old_assessment_missing_primary_direction_fallback() -> None:
+    text = format_attention_alert(
+        make_alert_assessment(
+            primary_family=scoring.PRICE,
+            evidence={"display_facts": {"price": {"window_minutes": 5, "change_pct": "18.6"}}},
+        )
+    )
+    assert "价格异动｜Mixed｜ATT 70" in text
+
+
+def test_short_address_and_copy_button() -> None:
+    ca = "0xb6ec6e6e58354d956ef1a2ed6693d5c7056298d2"
+    assessment = make_alert_assessment(token_address=ca)
+
+    assert short_address(ca) == "0xb6e...8d2"
+    markup = build_attention_copy_markup(assessment)
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "📋 0xb6e...8d2"
+    assert button.copy_text is not None
+    assert button.copy_text.text == ca
+
+
+@pytest.mark.asyncio
+async def test_attention_notification_sends_reply_markup(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    captured: list[tuple[int, str, object]] = []
+
+    async def notify_with_markup(chat_id: int, text: str, reply_markup=None) -> None:
+        captured.append((chat_id, text, reply_markup))
+
+    add_watched(session_factory, wallet_id)
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify_with_markup)
+    assessment = await service.simulate_assessment(
+        wallet_id,
+        TOKEN,
+        symbol="WINK",
+        family_scores={scoring.PRICE: 40},
+        usd_value=Decimal("600"),
+        direction=scoring.NEGATIVE,
+    )
+
+    assert await service._notify_assessment(assessment) is True
+
+    assert len(captured) == 1
+    _, text, reply_markup = captured[0]
+    assert "WINK" in text
+    assert reply_markup is not None
+    button = reply_markup.inline_keyboard[0][0]
+    assert button.text == f"📋 {short_address(TOKEN)}"
+    assert button.copy_text.text == TOKEN
+
+
+@pytest.mark.asyncio
 async def test_price_snapshot_update_without_price_score_does_not_assess(ctx) -> None:
     app_settings, session_factory, sent, notify, wallet_id = ctx
     now = utc_now()
@@ -1951,6 +3966,103 @@ async def test_recovery_above_min_restores_normal_price_trigger(ctx) -> None:
     assert recovered.price_score > 0
     evidence = json.loads(recovered.evidence_json)
     assert evidence["assessment_trigger"] == "price_threshold"
+
+
+@pytest.mark.asyncio
+async def test_token_snapshot_scan_syncs_social_identity_without_extra_gmgn_calls(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10), symbol="ROBBIE")
+    add_price_snapshot(session_factory, wallet_id, observed_at=now, usd_value="50", symbol="ROBBIE")
+    overview = GmgnTokenOverview(
+        chain="robinhood",
+        token_address=TOKEN,
+        symbol="ROBBIE",
+        name="ROBBIE",
+        price_usd=Decimal("1"),
+        market_cap_usd=Decimal("1000000"),
+        fdv_usd=None,
+        liquidity_usd=Decimal("100000"),
+        holder_count=500,
+        top10_holder_rate=None,
+        smart_money_count=None,
+        kol_count=None,
+        creator_address="0xbfcc000000000000000000000000000000000001",
+        created_at=None,
+        twitter="@RobbieOnRH",
+        telegram=None,
+        website=None,
+        raw={},
+    )
+    gmgn = FakeOverviewGmgn(overview)
+    service = AttentionEngineService(session_factory, gmgn, app_settings, notify)
+
+    async def no_assessment(wallet_id: int, token_address: str):  # noqa: ANN001
+        return None
+
+    service.assess_token = no_assessment
+    result = await service.scan_token_snapshots()
+
+    assert result.gmgn_calls == 1
+    assert gmgn.overview_calls == 1
+    with session_scope(session_factory) as session:
+        identities = list(session.scalars(select(SocialIdentity).order_by(SocialIdentity.identity_type.asc())))
+        snapshots = list(session.scalars(select(TokenIntelligenceSnapshot)))
+    assert {(row.identity_type, row.normalized_value) for row in identities} == {
+        ("dev_wallet", "0xbfcc000000000000000000000000000000000001"),
+        ("project_x", "robbieonrh"),
+    }
+    assert len(snapshots) == 1
+
+
+@pytest.mark.asyncio
+async def test_social_identity_sync_failure_does_not_block_token_snapshot(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, observed_at=now, usd_value="50")
+    overview = GmgnTokenOverview(
+        chain="robinhood",
+        token_address=TOKEN,
+        symbol="WINK",
+        name="WINK",
+        price_usd=Decimal("1"),
+        market_cap_usd=Decimal("1000000"),
+        fdv_usd=None,
+        liquidity_usd=Decimal("100000"),
+        holder_count=500,
+        top10_holder_rate=None,
+        smart_money_count=None,
+        kol_count=None,
+        creator_address=None,
+        created_at=None,
+        twitter="@Wink",
+        telegram=None,
+        website=None,
+        raw={},
+    )
+
+    class FailingIdentityService:
+        def sync_from_token_overview(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("identity down")
+
+    service = AttentionEngineService(
+        session_factory,
+        FakeOverviewGmgn(overview),
+        app_settings,
+        notify,
+        social_identity_service=FailingIdentityService(),
+    )
+
+    async def no_assessment(wallet_id: int, token_address: str):  # noqa: ANN001
+        return None
+
+    service.assess_token = no_assessment
+    result = await service.scan_token_snapshots()
+
+    assert result.errors is None
+    with session_scope(session_factory) as session:
+        assert len(list(session.scalars(select(TokenIntelligenceSnapshot)))) == 1
 
 
 def test_fingerprint_is_stable() -> None:

@@ -1,0 +1,25 @@
+{
+  "description": "Wallet Agent Fixed KOL Pool V1",
+  "kols": [
+    {
+      "username": "lookonchain",
+      "enabled": true
+    },
+    {
+      "username": "whale_alert",
+      "enabled": true
+    },
+    {
+      "username": "WuBlockchain",
+      "enabled": true
+    },
+    {
+      "username": "DegenerateNews",
+      "enabled": true
+    },
+    {
+      "username": "tier10k",
+      "enabled": true
+    }
+  ]
+}

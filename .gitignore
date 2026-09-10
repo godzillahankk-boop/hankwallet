@@ -7,5 +7,10 @@ __pycache__/
 .coverage
 data/*.db
 data/*.db-*
-logs/*.log
+logs/
 .DS_Store
+data/twitter_social_paused_rules.json
+data/twitter_social_rule_shards.json
+data/twitter_token_shadow_paused_rules.json
+data/twitter_token_shadow_rule_shards.json
+outputs/
