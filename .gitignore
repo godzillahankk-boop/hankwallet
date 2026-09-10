@@ -14,3 +14,4 @@ data/twitter_social_rule_shards.json
 data/twitter_token_shadow_paused_rules.json
 data/twitter_token_shadow_rule_shards.json
 outputs/
+.env.production
