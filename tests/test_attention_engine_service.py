@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -16,7 +16,9 @@ from app.db.models import (
     AttentionAssessment,
     IntelligenceEvent,
     PriceSnapshot,
+    SocialEvent,
     SocialIdentity,
+    SocialMemory,
     TokenIntelligenceSnapshot,
     TokenWatchState,
     TopHolderPeak,
@@ -45,6 +47,10 @@ from app.services.attention_engine_service import (
 )
 from app.services.gmgn_client import GmgnHolder, GmgnMarketSignal, GmgnTokenOverview, GmgnTrackTrade
 from app.services.price_quality import PRICE_QUALITY_OUTLIER, PRICE_QUALITY_PENDING, PRICE_QUALITY_VALID
+from app.services.social_event_service import AUTHOR_DEV_X, AUTHOR_KOL, AUTHOR_PROJECT_X, SocialEventService
+from app.services.social_memory_service import SocialMemoryService
+from app.services.social_token_matcher import TokenMatch
+from app.services.twitterapi_io_client import NormalizedTweet
 from app.services.wallet_service import WalletService
 from app.utils.time import utc_now
 
@@ -285,6 +291,130 @@ def add_token_intel(
                 observed_at=observed_at,
             )
         )
+
+
+def add_social_event(
+    session_factory,
+    wallet_id: int,
+    *,
+    token: str = TOKEN,
+    symbol: str = "WINK",
+    tweet_id: str,
+    author_id: str | None = None,
+    username: str = "kol",
+    author_type: str = AUTHOR_KOL,
+    posted_at=None,
+    match_type: str = "direct_ca",
+) -> None:
+    posted = posted_at or utc_now()
+    with session_scope(session_factory) as session:
+        watch = session.scalar(
+            select(TokenWatchState).where(
+                TokenWatchState.wallet_id == wallet_id,
+                TokenWatchState.token_address == token,
+                TokenWatchState.active.is_(True),
+            )
+        )
+        assert watch is not None
+        session.add(
+            SocialEvent(
+                wallet_id=wallet_id,
+                watch_state_id=watch.id,
+                chain=watch.chain,
+                token_address=token,
+                symbol=symbol,
+                provider="twitterapi_io",
+                provider_event_id=tweet_id,
+                author_id=author_id,
+                author_username=username,
+                author_type=author_type,
+                posted_at=posted,
+                received_at=posted + timedelta(seconds=2),
+                ingestion_type="stream",
+                post_type="original",
+                text="$WINK",
+                match_type=match_type,
+                matched_value=token,
+                tweet_url=f"https://x.com/{username}/status/{tweet_id}",
+            )
+        )
+
+
+def add_social_memory(
+    session_factory,
+    *,
+    token: str = TOKEN,
+    symbol: str = "WINK",
+    tweet_id: str,
+    significance: str = "medium",
+    event_time=None,
+    author_type: str = AUTHOR_PROJECT_X,
+    url: str | None = None,
+) -> None:
+    event_at = event_time or utc_now()
+    with session_scope(session_factory) as session:
+        session.add(
+            SocialMemory(
+                chain="robinhood",
+                token_address=token,
+                symbol=symbol,
+                project_identity="project",
+                project_key=f"robinhood:{token}",
+                source_author_id="project-author",
+                source_username="ProjectUser",
+                source_author_type=author_type,
+                provider="twitterapi_io",
+                tweet_id=tweet_id,
+                tweet_url=url or f"https://x.com/ProjectUser/status/{tweet_id}",
+                event_time=event_at,
+                category="development",
+                summary="Project announced a meaningful update.",
+                significance=significance,
+                confidence="high",
+                information_scope="project",
+                triage_version="test",
+            )
+        )
+
+
+def social_tweet(
+    tweet_id: str,
+    *,
+    token: str = TOKEN,
+    username: str = "kol",
+    author_id: str | None = "author-1",
+    text: str = "$WINK",
+    created_at=None,
+) -> NormalizedTweet:
+    created = created_at or datetime.now(UTC)
+    return NormalizedTweet(
+        provider="twitterapi_io",
+        tweet_id=tweet_id,
+        author_id=author_id,
+        author_username=username,
+        author_name=username,
+        author_followers=10000,
+        text=text,
+        created_at=created,
+        detected_at=created + timedelta(seconds=2),
+        is_reply=False,
+        in_reply_to_id=None,
+        in_reply_to_username=None,
+        conversation_id=tweet_id,
+        is_quote=False,
+        quoted_tweet_id=None,
+        quoted_tweet=None,
+        is_retweet=False,
+        retweeted_tweet_id=None,
+        retweeted_tweet=None,
+        like_count=1,
+        retweet_count=0,
+        reply_count=0,
+        quote_count=0,
+        view_count=100,
+        token_matches=[TokenMatch("direct_ca", token.lower(), token)],
+        raw={},
+    )
 
 
 def trade(
@@ -3548,6 +3678,22 @@ def test_format_attention_alert_removes_redundant_title_and_internal_level() -> 
     assert text.index("• 聪明钱｜15m +6钱包 +$4.8k") < text.index("• KOL｜15m +2钱包 +$1.2k")
 
 
+@pytest.mark.parametrize(
+    ("direction", "expected_emoji"),
+    [
+        (scoring.POSITIVE, "🟢"),
+        (scoring.NEGATIVE, "🔴"),
+        (scoring.MIXED, "🟠"),
+        (scoring.NEUTRAL, "⚪️"),
+        ("unknown", "⚪️"),
+    ],
+)
+def test_format_attention_alert_direction_emoji_is_explicit(direction, expected_emoji) -> None:
+    text = format_attention_alert(make_alert_assessment(direction=direction))
+
+    assert text.splitlines()[0].startswith(f"{expected_emoji} $ROBBIE")
+
+
 def test_format_attention_alert_orders_display_facts_and_omits_missing() -> None:
     text = format_attention_alert(
         make_alert_assessment(
@@ -3599,6 +3745,689 @@ def test_format_attention_alert_orders_display_facts_and_omits_missing() -> None
 )
 def test_format_directional_trigger_title_mappings(family, direction, signal, trigger, expected) -> None:
     assert format_directional_trigger_title(family, direction, trigger, signal) == expected
+
+
+@pytest.mark.parametrize(
+    ("distinct_kols", "expected"),
+    [(0, 0), (1, 12), (2, 20), (3, 28), (4, 32), (5, 36), (6, 36), (7, 40), (9, 40)],
+)
+def test_social_kol_heat_score_table(distinct_kols, expected) -> None:
+    assert scoring.social_kol_heat_score(distinct_kols) == expected
+
+
+@pytest.mark.parametrize(
+    ("significance", "expected"),
+    [("low", 15), ("medium", 28), ("high", 40), (None, 0)],
+)
+def test_social_dev_update_score_table(significance, expected) -> None:
+    assert scoring.social_dev_update_score(significance) == expected
+
+
+@pytest.mark.asyncio
+async def test_high_dev_memory_adds_modifier_and_crosses_warning_at_50_usd(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, usd_value="50")
+    add_social_memory(session_factory, tweet_id="high-dev-modifier", significance="high")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["highest_dev_significance"] == "high"
+    assert assessment.base_attention_score == 50
+    assert assessment.dev_modifier == 5
+    assert evidence["dev_modifier_reason"] == "high_dev_update"
+    assert assessment.final_attention_score == 55
+    assert assessment.attention_level == scoring.WARNING
+    assert assessment.should_notify is True
+
+
+@pytest.mark.asyncio
+async def test_low_and_medium_dev_memory_do_not_add_modifier(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, usd_value="50")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    add_social_memory(session_factory, tweet_id="low-dev-no-modifier", significance="low")
+    low = await service.assess_token(wallet_id, TOKEN)
+    assert low is not None
+    assert low.dev_modifier == 0
+    assert low.final_attention_score == 25
+
+    with session_scope(session_factory) as session:
+        session.query(SocialMemory).delete()
+    add_social_memory(session_factory, tweet_id="medium-dev-no-modifier", significance="medium")
+    medium = await service.assess_token(wallet_id, TOKEN)
+    assert medium is not None
+    assert medium.dev_modifier == 0
+    assert medium.final_attention_score == 38
+
+
+@pytest.mark.asyncio
+async def test_pure_social_kol_heat_does_not_add_dev_modifier(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, usd_value="50")
+    for index in range(7):
+        add_social_event(
+            session_factory,
+            wallet_id,
+            tweet_id=f"pure-kol-{index}",
+            author_id=f"pure-kol-{index}",
+            username=f"kol{index}",
+        )
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["social_score"] == 40
+    assert evidence["social"]["highest_dev_significance"] is None
+    assert assessment.dev_modifier == 0
+    assert assessment.final_attention_score == 50
+    assert assessment.attention_level == scoring.NOTICE
+
+
+@pytest.mark.parametrize(
+    ("usd_value", "expected_final", "expected_level", "expected_notify"),
+    [
+        ("20", 53, scoring.NOTICE, False),
+        ("50", 55, scoring.WARNING, True),
+        ("250", 62, scoring.WARNING, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_high_dev_modifier_matrix_for_representative_exposures(
+    ctx,
+    usd_value,
+    expected_final,
+    expected_level,
+    expected_notify,
+) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, usd_value=usd_value)
+    add_social_memory(session_factory, tweet_id=f"high-dev-{usd_value}", significance="high")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.dev_modifier == 5
+    assert assessment.final_attention_score == expected_final
+    assert assessment.attention_level == expected_level
+    assert assessment.should_notify is expected_notify
+
+
+@pytest.mark.asyncio
+async def test_high_dev_modifier_applies_when_social_is_not_primary_without_changing_direction(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="1.5", observed_at=now)
+    add_token_intel(session_factory, wallet_id, market_cap="1000000", liquidity="100000", observed_at=now)
+    add_social_memory(session_factory, tweet_id="price-primary-high-dev", significance="high", event_time=now)
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.price_score == 40
+    assert assessment.primary_family == scoring.PRICE
+    assert assessment.dev_modifier == 5
+    assert assessment.direction == scoring.POSITIVE
+    assert "价格上涨｜Positive" in format_attention_alert(assessment)
+
+
+@pytest.mark.asyncio
+async def test_high_dev_memory_outside_attention_window_does_not_add_modifier(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=30))
+    add_price_snapshot(session_factory, wallet_id, observed_at=now)
+    add_token_intel(session_factory, wallet_id, observed_at=now)
+    add_social_memory(
+        session_factory,
+        tweet_id="old-window-high-dev",
+        significance="high",
+        event_time=now - timedelta(minutes=20),
+    )
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["meaningful_dev_updates"] == 0
+    assert assessment.dev_modifier == 0
+
+
+@pytest.mark.asyncio
+async def test_social_attention_distinct_kol_scores_and_dedupes_same_author(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    add_social_event(session_factory, wallet_id, tweet_id="tweet-1", author_id="a1", username="Nancy", posted_at=now)
+    add_social_event(session_factory, wallet_id, tweet_id="tweet-2", author_id="a1", username="Nancy", posted_at=now)
+    add_social_event(session_factory, wallet_id, tweet_id="tweet-3", author_id="a2", username="Lookonchain", posted_at=now, match_type="direct_cashtag")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["unique_kols"] == 2
+    assert evidence["social"]["kol_posts"] == 3
+    assert evidence["social"]["x_kol_heat_score"] == 20
+    assert evidence["family_scores"][scoring.SOCIAL] == 20
+
+
+@pytest.mark.asyncio
+async def test_social_attention_dev_memory_uses_social_memory_not_raw_project_event(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    add_social_event(session_factory, wallet_id, tweet_id="project-gm", author_type=AUTHOR_PROJECT_X, username="ProjectUser")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    raw_only = await service.assess_token(wallet_id, TOKEN)
+    assert raw_only is not None
+    raw_evidence = json.loads(raw_only.evidence_json)
+    assert raw_evidence["social"]["meaningful_dev_updates"] == 0
+    assert raw_evidence["family_scores"][scoring.SOCIAL] == 0
+    assert raw_only.dev_modifier == 0
+
+    add_social_memory(session_factory, tweet_id="memory-low", significance="low")
+    low = await service.assess_token(wallet_id, TOKEN)
+    assert low is not None
+    low_evidence = json.loads(low.evidence_json)
+    assert low_evidence["social"]["meaningful_dev_updates"] == 1
+    assert low_evidence["social"]["highest_dev_significance"] == "low"
+    assert low_evidence["family_scores"][scoring.SOCIAL] == 15
+
+
+@pytest.mark.asyncio
+async def test_social_attention_dev_memory_isolated_by_current_watch_session(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=20))
+    add_price_snapshot(session_factory, wallet_id, observed_at=now - timedelta(minutes=10))
+    add_token_intel(session_factory, wallet_id, observed_at=now - timedelta(minutes=10))
+    add_social_memory(
+        session_factory,
+        tweet_id="session-a-dev-memory",
+        significance="high",
+        event_time=now - timedelta(minutes=5),
+    )
+    add_social_event(
+        session_factory,
+        wallet_id,
+        tweet_id="session-a-kol",
+        author_id="old-session-kol",
+        posted_at=now - timedelta(minutes=5),
+    )
+    end_active_watch(session_factory, wallet_id, ended_at=now - timedelta(minutes=2))
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=1))
+    add_price_snapshot(session_factory, wallet_id, observed_at=now)
+    add_token_intel(session_factory, wallet_id, observed_at=now)
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    new_session_before_memory = await service.assess_token(wallet_id, TOKEN)
+
+    assert new_session_before_memory is not None
+    evidence = json.loads(new_session_before_memory.evidence_json)
+    assert evidence["social"]["meaningful_dev_updates"] == 0
+    assert evidence["social"]["dev_update_score"] == 0
+    assert evidence["social"]["unique_kols"] == 0
+    assert evidence["social"]["x_kol_heat_score"] == 0
+    assert evidence["family_scores"][scoring.SOCIAL] == 0
+    assert new_session_before_memory.dev_modifier == 0
+    with session_scope(session_factory) as session:
+        assert len(list(session.scalars(select(SocialMemory)))) == 1
+
+    add_social_memory(
+        session_factory,
+        tweet_id="session-b-dev-memory",
+        significance="high",
+        event_time=now,
+    )
+
+    new_session_after_memory = await service.assess_token(wallet_id, TOKEN)
+
+    assert new_session_after_memory is not None
+    new_evidence = json.loads(new_session_after_memory.evidence_json)
+    assert new_evidence["social"]["meaningful_dev_updates"] == 1
+    assert new_evidence["social"]["dev_update_score"] == 40
+    assert new_evidence["social"]["unique_kols"] == 0
+    assert new_evidence["family_scores"][scoring.SOCIAL] == 40
+    assert new_session_after_memory.dev_modifier == 5
+    with session_scope(session_factory) as session:
+        assert len(list(session.scalars(select(SocialMemory)))) == 2
+
+
+@pytest.mark.asyncio
+async def test_social_attention_dev_significance_and_tie_prioritize_dev(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    for index in range(7):
+        add_social_event(
+            session_factory,
+            wallet_id,
+            tweet_id=f"kol-{index}",
+            author_id=f"author-{index}",
+            username=f"kol{index}",
+            posted_at=now,
+        )
+    add_social_memory(session_factory, tweet_id="memory-medium", significance="medium", event_time=now)
+    add_social_memory(
+        session_factory,
+        tweet_id="memory-high",
+        significance="high",
+        event_time=now + timedelta(seconds=1),
+        url="https://x.com/ProjectUser/status/memory-high",
+    )
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["unique_kols"] == 7
+    assert evidence["social"]["meaningful_dev_updates"] == 2
+    assert evidence["social"]["highest_dev_significance"] == "high"
+    assert evidence["social"]["social_score"] == 40
+    assert evidence["primary_family"] == scoring.SOCIAL
+    assert evidence["primary_signal"] == "dev_project_update"
+    assert assessment.primary_family == scoring.SOCIAL
+    assert assessment.dev_modifier == 5
+    assert assessment.direction == scoring.NEUTRAL
+    assert "• 社媒｜15m KOL+7 DEV+2" in format_attention_alert(assessment)
+    markup = build_attention_copy_markup(assessment)
+    assert markup.inline_keyboard[1][0].text == "🔗 查看DEV更新"
+    assert markup.inline_keyboard[1][0].url == "https://x.com/ProjectUser/status/memory-high"
+
+
+@pytest.mark.asyncio
+async def test_social_dev_button_uses_latest_memory_within_highest_significance_tier(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    add_social_memory(
+        session_factory,
+        tweet_id="older-high",
+        significance="high",
+        event_time=now - timedelta(minutes=4),
+        url="https://x.com/testdev/status/high",
+    )
+    add_social_memory(
+        session_factory,
+        tweet_id="newer-medium",
+        significance="medium",
+        event_time=now,
+        url="https://x.com/testdev/status/medium",
+    )
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["highest_dev_significance"] == "high"
+    assert evidence["social"]["dev_update_score"] == 40
+    assert assessment.dev_modifier == 5
+    assert evidence["social"]["latest_dev_tweet_url"] == "https://x.com/testdev/status/high"
+    markup = build_attention_copy_markup(assessment)
+    assert markup.inline_keyboard[1][0].url == "https://x.com/testdev/status/high"
+
+    with session_scope(session_factory) as session:
+        session.query(SocialMemory).delete()
+
+    frozen_markup = build_attention_copy_markup(assessment)
+    assert frozen_markup.inline_keyboard[1][0].url == "https://x.com/testdev/status/high"
+
+
+@pytest.mark.asyncio
+async def test_social_dev_button_uses_latest_high_when_newer_medium_exists(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    add_social_memory(
+        session_factory,
+        tweet_id="high-1",
+        significance="high",
+        event_time=now - timedelta(minutes=6),
+        url="https://x.com/testdev/status/high-1",
+    )
+    add_social_memory(
+        session_factory,
+        tweet_id="high-2",
+        significance="high",
+        event_time=now - timedelta(minutes=2),
+        url="https://x.com/testdev/status/high-2",
+    )
+    add_social_memory(
+        session_factory,
+        tweet_id="medium-newer",
+        significance="medium",
+        event_time=now,
+        url="https://x.com/testdev/status/medium-newer",
+    )
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["highest_dev_significance"] == "high"
+    assert evidence["social"]["latest_dev_tweet_url"] == "https://x.com/testdev/status/high-2"
+    assert build_attention_copy_markup(assessment).inline_keyboard[1][0].url == "https://x.com/testdev/status/high-2"
+
+
+@pytest.mark.asyncio
+async def test_social_dev_button_uses_latest_medium_when_medium_is_highest(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    now = utc_now()
+    add_social_memory(
+        session_factory,
+        tweet_id="medium-1",
+        significance="medium",
+        event_time=now - timedelta(minutes=3),
+        url="https://x.com/testdev/status/medium-1",
+    )
+    add_social_memory(
+        session_factory,
+        tweet_id="medium-2",
+        significance="medium",
+        event_time=now,
+        url="https://x.com/testdev/status/medium-2",
+    )
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["social"]["highest_dev_significance"] == "medium"
+    assert evidence["social"]["latest_dev_tweet_url"] == "https://x.com/testdev/status/medium-2"
+    assert assessment.dev_modifier == 0
+    assert build_attention_copy_markup(assessment).inline_keyboard[1][0].url == "https://x.com/testdev/status/medium-2"
+
+
+@pytest.mark.asyncio
+async def test_social_can_be_secondary_without_changing_price_direction(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="1.4", observed_at=now)
+    add_token_intel(session_factory, wallet_id, market_cap="1000000", liquidity="100000", observed_at=now)
+    for index in range(3):
+        add_social_event(session_factory, wallet_id, tweet_id=f"kol-secondary-{index}", author_id=f"a{index}")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.primary_family == scoring.PRICE
+    assert assessment.secondary_family_1 == scoring.SOCIAL
+    assert assessment.direction == scoring.POSITIVE
+
+
+def test_social_primary_titles() -> None:
+    assert (
+        format_directional_trigger_title(scoring.SOCIAL, scoring.NEUTRAL, None, "social_kol_heat")
+        == "社媒热度上升"
+    )
+    assert (
+        format_directional_trigger_title(scoring.SOCIAL, scoring.NEUTRAL, None, "dev_project_update")
+        == "DEV推特更新"
+    )
+
+
+@pytest.mark.asyncio
+async def test_social_display_lines_for_kol_only_and_dev_only(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    for index in range(3):
+        add_social_event(session_factory, wallet_id, tweet_id=f"kol-display-{index}", author_id=f"display-{index}")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    kol_only = await service.assess_token(wallet_id, TOKEN)
+    assert kol_only is not None
+    assert "• 社媒｜15m KOL+3" in format_attention_alert(kol_only)
+
+    with session_scope(session_factory) as session:
+        session.query(SocialEvent).delete()
+    add_social_memory(session_factory, tweet_id="dev-only", significance="medium")
+
+    dev_only = await service.assess_token(wallet_id, TOKEN)
+    assert dev_only is not None
+    assert "• 社媒｜15m DEV+1" in format_attention_alert(dev_only)
+
+
+@pytest.mark.asyncio
+async def test_social_event_service_triggers_kol_and_keep_memory_only(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    triggered: list[tuple[str, object | None]] = []
+
+    class FakeMemoryProcessor:
+        def __init__(self, keep: bool) -> None:
+            self.keep = keep
+
+        def process_event(self, event):  # noqa: ANN001
+            return object() if self.keep else None
+
+    service = SocialEventService(
+        session_factory,
+        memory_processor=FakeMemoryProcessor(keep=False),
+        social_update_callback=lambda event, memory: triggered.append((event.author_type, memory)),
+    )
+    service.create_event_if_relevant(
+        social_tweet("kol-trigger", username="kol", author_id="kol-author"),
+        known_kol_usernames={"kol"},
+    )
+    service.create_event_if_relevant(
+        social_tweet("project-no-memory", username="ProjectUser", author_id="project-author"),
+    )
+
+    assert [item[0] for item in triggered] == [AUTHOR_KOL]
+
+    with session_scope(session_factory) as session:
+        identity = SocialIdentity(
+            chain="robinhood",
+            token_address=TOKEN,
+            symbol="WINK",
+            identity_type="project_x",
+            value="@ProjectUser",
+            normalized_value="projectuser",
+            source="test",
+            source_field="test",
+            confidence="HIGH",
+            evidence_json=None,
+            is_active=True,
+            first_seen_at=utc_now(),
+            last_verified_at=utc_now(),
+            valid_from=utc_now(),
+        )
+        session.add(identity)
+
+    keep_service = SocialEventService(
+        session_factory,
+        memory_processor=FakeMemoryProcessor(keep=True),
+        social_update_callback=lambda event, memory: triggered.append((event.author_type, memory)),
+    )
+    keep_service.create_event_if_relevant(
+        social_tweet("project-keep", username="ProjectUser", author_id="project-author"),
+    )
+
+    assert triggered[-1][0] == AUTHOR_PROJECT_X
+    assert triggered[-1][1] is not None
+
+
+@pytest.mark.asyncio
+async def test_handle_social_update_assesses_and_notifies_through_attention_cooldown(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, usd_value="600")
+    for index in range(7):
+        add_social_event(session_factory, wallet_id, tweet_id=f"notify-social-{index}", author_id=f"notify-{index}")
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=SocialEventService(session_factory),
+        social_memory_service=SocialMemoryService(session_factory),
+    )
+
+    assessment = await service.handle_social_update(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.should_notify is True
+    assert sent
+    assert "社媒热度上升" in sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_social_query_failure_fails_closed_and_existing_attention_still_assesses(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    now = utc_now()
+    start_watch_session(session_factory, wallet_id, started_at=now - timedelta(minutes=10))
+    add_price_snapshot(session_factory, wallet_id, price="1", observed_at=now - timedelta(minutes=5))
+    add_price_snapshot(session_factory, wallet_id, price="1.4", observed_at=now)
+    add_token_intel(session_factory, wallet_id, market_cap="1000000", liquidity="100000", observed_at=now)
+
+    class FailingSocialEvents:
+        def build_social_facts(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("social down")
+
+    class FailingSocialMemory:
+        def get_recent_memories(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("memory down")
+
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        social_event_service=FailingSocialEvents(),
+        social_memory_service=FailingSocialMemory(),
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    assert assessment.price_score > 0
+    assert assessment.dev_modifier == 0
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["family_scores"][scoring.SOCIAL] == 0
 
 
 @pytest.mark.parametrize(

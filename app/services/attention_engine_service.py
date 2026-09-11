@@ -38,7 +38,9 @@ from app.services.gmgn_client import (
     GmgnTrackTrade,
 )
 from app.services.price_quality import PRICE_QUALITY_VALID
+from app.services.social_event_service import SocialEventService
 from app.services.social_identity_service import SocialIdentityService
+from app.services.social_memory_service import SocialMemoryService
 from app.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -166,6 +168,36 @@ class PositionIntelligenceResult:
         }
 
 
+@dataclass(frozen=True)
+class SocialAttentionFact:
+    window_minutes: int
+    unique_kols: int
+    kol_posts: int
+    meaningful_dev_updates: int
+    highest_dev_significance: str | None
+    latest_dev_tweet_url: str | None
+    latest_dev_memory_id: int | None
+    x_kol_heat_score: int
+    dev_update_score: int
+    social_score: int
+    primary_social_signal: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "window_minutes": self.window_minutes,
+            "unique_kols": self.unique_kols,
+            "kol_posts": self.kol_posts,
+            "meaningful_dev_updates": self.meaningful_dev_updates,
+            "highest_dev_significance": self.highest_dev_significance,
+            "latest_dev_tweet_url": self.latest_dev_tweet_url,
+            "latest_dev_memory_id": self.latest_dev_memory_id,
+            "x_kol_heat_score": self.x_kol_heat_score,
+            "dev_update_score": self.dev_update_score,
+            "social_score": self.social_score,
+            "primary_social_signal": self.primary_social_signal,
+        }
+
+
 class AttentionEngineService:
     def __init__(
         self,
@@ -174,13 +206,26 @@ class AttentionEngineService:
         settings: Settings,
         notifier: Notifier | None = None,
         social_identity_service: SocialIdentityService | None = None,
+        social_event_service: SocialEventService | None = None,
+        social_memory_service: SocialMemoryService | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gmgn_client = gmgn_client
         self.settings = settings
         self.notifier = notifier
         self.social_identity_service = social_identity_service or SocialIdentityService(session_factory)
+        self.social_event_service = social_event_service
+        self.social_memory_service = social_memory_service
         self._notification_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+    def set_social_services(
+        self,
+        *,
+        social_event_service: SocialEventService | None = None,
+        social_memory_service: SocialMemoryService | None = None,
+    ) -> None:
+        self.social_event_service = social_event_service
+        self.social_memory_service = social_memory_service
 
     async def scan_smart_money_feed(self) -> AttentionRunResult:
         return await self._scan_feed("smartmoney", scoring.SMART_MONEY)
@@ -333,12 +378,15 @@ class AttentionEngineService:
                 latest_intel,
                 watched.watch_started_at,
             )
+            social_fact = self._social_attention_fact(watched)
+            social_score = social_fact.social_score if social_fact else 0
             family_scores = {
                 scoring.PRICE: price_score,
                 scoring.HOLDER: holder_family,
                 scoring.SMART_MONEY: smart_score,
                 scoring.KOL: kol_score,
                 scoring.LIQUIDITY: liq_score,
+                scoring.SOCIAL: social_score,
             }
             assessment_scores = {
                 "price_score": price_score,
@@ -349,6 +397,7 @@ class AttentionEngineService:
                 "smart_money_score": smart_score,
                 "kol_score": kol_score,
                 "liquidity_score": liq_score,
+                "social_score": social_score,
             }
             primary_family, primary_score = max(family_scores.items(), key=lambda item: item[1])
             if primary_score == 0:
@@ -356,7 +405,8 @@ class AttentionEngineService:
             secondary = scoring.secondary_signal_score(family_scores, primary_family)
             exposure = scoring.position_exposure_score(watched.usd_value)
             base = min(100, primary_score + exposure + abnormality + secondary.score)
-            dev_modifier = 0
+            dev_modifier = _dev_modifier_for_social_fact(social_fact)
+            dev_modifier_reason = "high_dev_update" if dev_modifier else None
             final = scoring.final_attention_score(base, dev_modifier)
             level = scoring.attention_level(final)
             direction = scoring.combine_direction(
@@ -368,7 +418,13 @@ class AttentionEngineService:
                     liq_direction if liq_score else scoring.NEUTRAL,
                 ]
             )
-            primary_signal = _primary_signal_for_family(primary_family, holder_breadth, top_holder, cluster)
+            primary_signal = _primary_signal_for_family(
+                primary_family,
+                holder_breadth,
+                top_holder,
+                cluster,
+                social_fact,
+            )
             primary_direction = _primary_direction_for_family(
                 primary_family,
                 {
@@ -377,6 +433,7 @@ class AttentionEngineService:
                     scoring.SMART_MONEY: _feed_primary_display_direction(smart_fact, smart_direction),
                     scoring.KOL: _feed_primary_display_direction(kol_fact, kol_direction),
                     scoring.LIQUIDITY: liq_direction,
+                    scoring.SOCIAL: scoring.NEUTRAL,
                 },
                 direction,
             )
@@ -395,6 +452,8 @@ class AttentionEngineService:
                 primary_family,
                 primary_direction,
                 primary_signal,
+                social_fact,
+                dev_modifier_reason,
             )
             should_notify = self._should_notify(session, wallet_id, token_address, level, final, direction, family_scores, now)
             assessment = AttentionAssessment(
@@ -487,6 +546,20 @@ class AttentionEngineService:
             token_address,
             allow_below_min_value=allow_below_min_value,
             assessment_trigger=trigger,
+        )
+        if assessment and assessment.should_notify:
+            await self._notify_assessment(assessment)
+        return assessment
+
+    async def handle_social_update(
+        self,
+        wallet_id: int,
+        token_address: str,
+    ) -> AttentionAssessment | None:
+        assessment = await self.assess_token(
+            wallet_id,
+            token_address,
+            assessment_trigger="social_update",
         )
         if assessment and assessment.should_notify:
             await self._notify_assessment(assessment)
@@ -1477,6 +1550,7 @@ class AttentionEngineService:
         price_change: Decimal | None,
         price_window: int | None,
         watch_started_at: datetime | None,
+        social_fact: SocialAttentionFact | None = None,
     ) -> dict[str, Any]:
         facts: dict[str, Any] = {}
         price_fact = self._price_display_fact(
@@ -1518,7 +1592,87 @@ class AttentionEngineService:
                 "current_usd": str(liquidity_fact.current_usd),
                 "change_pct": str(liquidity_fact.change_pct),
             }
+        if social_fact and (social_fact.unique_kols > 0 or social_fact.meaningful_dev_updates > 0):
+            facts["social"] = {
+                "window_minutes": social_fact.window_minutes,
+                "unique_kols": social_fact.unique_kols,
+                "kol_posts": social_fact.kol_posts,
+                "meaningful_dev_updates": social_fact.meaningful_dev_updates,
+            }
         return facts
+
+    def _social_attention_fact(self, watched: WatchedToken) -> SocialAttentionFact | None:
+        window_minutes = self.settings.attention_feed_window_minutes
+        unique_kols = 0
+        kol_posts = 0
+        if self.social_event_service is not None:
+            try:
+                event_facts = self.social_event_service.build_social_facts(
+                    watched.wallet_id,
+                    watched.token_address,
+                    window_minutes,
+                )
+                unique_kols = event_facts.unique_kols
+                kol_posts = event_facts.kol_posts
+            except Exception as exc:  # noqa: BLE001 - social must fail closed.
+                logger.warning(
+                    "Social KOL facts failed wallet_id=%s token=%s: %s",
+                    watched.wallet_id,
+                    watched.token_address,
+                    exc,
+                )
+        memories = []
+        if self.social_memory_service is not None:
+            try:
+                memory_since = max(
+                    utc_now() - timedelta(minutes=window_minutes),
+                    watched.watch_started_at,
+                )
+                memories = self.social_memory_service.get_recent_memories(
+                    chain=watched.chain,
+                    token_address=watched.token_address,
+                    since=memory_since,
+                    limit=50,
+                )
+            except Exception as exc:  # noqa: BLE001 - social must fail closed.
+                logger.warning(
+                    "Social memory facts failed wallet_id=%s token=%s: %s",
+                    watched.wallet_id,
+                    watched.token_address,
+                    exc,
+                )
+                memories = []
+        x_kol_score = scoring.social_kol_heat_score(unique_kols)
+        highest_significance = _highest_social_significance(
+            [memory.significance for memory in memories]
+        )
+        dev_score = scoring.social_dev_update_score(highest_significance)
+        social_score = max(x_kol_score, dev_score)
+        if dev_score == social_score and dev_score > 0:
+            primary_signal = "dev_project_update"
+        elif x_kol_score > 0:
+            primary_signal = "social_kol_heat"
+        else:
+            primary_signal = None
+        highest_tier_memories = [
+            memory
+            for memory in memories
+            if highest_significance is not None and (memory.significance or "").lower() == highest_significance
+        ]
+        latest_memory = max(highest_tier_memories, key=lambda memory: (memory.event_time, memory.id), default=None)
+        return SocialAttentionFact(
+            window_minutes=window_minutes,
+            unique_kols=unique_kols,
+            kol_posts=kol_posts,
+            meaningful_dev_updates=len(memories),
+            highest_dev_significance=highest_significance,
+            latest_dev_tweet_url=latest_memory.tweet_url if latest_memory else None,
+            latest_dev_memory_id=latest_memory.id if latest_memory else None,
+            x_kol_heat_score=x_kol_score,
+            dev_update_score=dev_score,
+            social_score=social_score,
+            primary_social_signal=primary_signal,
+        )
 
     def _price_display_fact(
         self,
@@ -1653,6 +1807,8 @@ class AttentionEngineService:
         primary_family: str | None = None,
         primary_direction: str | None = None,
         primary_signal: str | None = None,
+        social_fact: SocialAttentionFact | None = None,
+        dev_modifier_reason: str | None = None,
     ) -> dict[str, Any]:
         cutoff = utc_now() - timedelta(minutes=self.settings.attention_event_aggregation_minutes)
         if watch_started_at is not None:
@@ -1679,6 +1835,7 @@ class AttentionEngineService:
             price_change,
             price_window,
             watch_started_at,
+            social_fact,
         )
         position_intelligence = build_position_intelligence(
             assessment_scores or {"price_score": family_scores.get(scoring.PRICE, 0)},
@@ -1690,6 +1847,8 @@ class AttentionEngineService:
             "primary_direction": primary_direction,
             "primary_signal": primary_signal,
             "family_scores": family_scores,
+            "social": social_fact.to_dict() if social_fact else None,
+            "dev_modifier_reason": dev_modifier_reason,
             "display_facts": display_facts,
             "position_intelligence": position_intelligence.to_dict(),
             "price_change_pct": str(price_change) if price_change is not None else None,
@@ -1951,7 +2110,7 @@ def _valid_price_snapshot_clause():
 
 def format_attention_alert(assessment: AttentionAssessment) -> str:
     symbol = assessment.symbol or assessment.token_address[:10]
-    emoji = "🔴" if assessment.direction == scoring.NEGATIVE else "🟠" if assessment.direction == scoring.MIXED else "🟢"
+    emoji = _direction_emoji(assessment.direction)
     evidence = _json_loads(assessment.evidence_json)
     trigger_title = format_directional_trigger_title(
         assessment.primary_family,
@@ -1985,17 +2144,35 @@ def format_attention_alert(assessment: AttentionAssessment) -> str:
     return "\n".join(lines)
 
 
+def _direction_emoji(direction: str | None) -> str:
+    if direction == scoring.POSITIVE:
+        return "🟢"
+    if direction == scoring.NEGATIVE:
+        return "🔴"
+    if direction == scoring.MIXED:
+        return "🟠"
+    return "⚪️"
+
+
 def build_attention_copy_markup(assessment: AttentionAssessment) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+    rows = [
         [
-            [
-                InlineKeyboardButton(
-                    f"📋 {short_address(assessment.token_address)}",
-                    copy_text=CopyTextButton(assessment.token_address),
-                )
-            ]
+            InlineKeyboardButton(
+                f"📋 {short_address(assessment.token_address)}",
+                copy_text=CopyTextButton(assessment.token_address),
+            )
         ]
-    )
+    ]
+    evidence = _json_loads(assessment.evidence_json)
+    social = evidence.get("social")
+    if (
+        isinstance(social, dict)
+        and int(social.get("meaningful_dev_updates") or 0) > 0
+        and isinstance(social.get("latest_dev_tweet_url"), str)
+        and social["latest_dev_tweet_url"].startswith(("http://", "https://"))
+    ):
+        rows.append([InlineKeyboardButton("🔗 查看DEV更新", url=social["latest_dev_tweet_url"])])
+    return InlineKeyboardMarkup(rows)
 
 
 def short_address(address: str) -> str:
@@ -2307,13 +2484,18 @@ def _has_new_strong_family(previous_scores: dict[str, Any], current_scores: dict
 
 
 def _family_scores_from_assessment(assessment: AttentionAssessment) -> dict[str, int]:
-    return {
+    scores = {
         scoring.PRICE: assessment.price_score,
         scoring.HOLDER: assessment.holder_family_score,
         scoring.SMART_MONEY: assessment.smart_money_score,
         scoring.KOL: assessment.kol_score,
         scoring.LIQUIDITY: assessment.liquidity_score,
     }
+    evidence = _json_loads(assessment.evidence_json)
+    family_scores = evidence.get("family_scores")
+    if isinstance(family_scores, dict):
+        scores[scoring.SOCIAL] = int(family_scores.get(scoring.SOCIAL, 0) or 0)
+    return scores
 
 
 def _primary_direction_for_family(
@@ -2326,7 +2508,15 @@ def _primary_direction_for_family(
     return family_directions.get(primary_family, scoring.NEUTRAL)
 
 
-def _primary_signal_for_family(primary_family: str | None, holder_breadth: int, top_holder: int, cluster: int) -> str | None:
+def _primary_signal_for_family(
+    primary_family: str | None,
+    holder_breadth: int,
+    top_holder: int,
+    cluster: int,
+    social_fact: SocialAttentionFact | None = None,
+) -> str | None:
+    if primary_family == scoring.SOCIAL:
+        return social_fact.primary_social_signal if social_fact else None
     if primary_family != scoring.HOLDER:
         return None
     holder_max = max(holder_breadth, top_holder, cluster)
@@ -2337,6 +2527,25 @@ def _primary_signal_for_family(primary_family: str | None, holder_breadth: int, 
     if top_holder == holder_max:
         return "top_holder_reduction"
     return "holder_cluster_reduction"
+
+
+def _highest_social_significance(values: list[str | None]) -> str | None:
+    rank = {"low": 1, "medium": 2, "high": 3}
+    best: str | None = None
+    best_rank = 0
+    for value in values:
+        normalized = (value or "").lower()
+        current_rank = rank.get(normalized, 0)
+        if current_rank > best_rank:
+            best = normalized
+            best_rank = current_rank
+    return best
+
+
+def _dev_modifier_for_social_fact(social_fact: SocialAttentionFact | None) -> int:
+    if social_fact and social_fact.highest_dev_significance == "high":
+        return 5
+    return 0
 
 
 def _holder_primary_direction(primary_signal: str | None, holder_breadth_direction: str) -> str:
@@ -2402,6 +2611,12 @@ def format_directional_trigger_title(
         return _directional_title(direction, "KOL资金流入", "KOL资金流出", "KOL资金异动")
     if primary_family == scoring.LIQUIDITY:
         return _directional_title(direction, "流动性增加", "流动性减少", "流动性异动")
+    if primary_family == scoring.SOCIAL:
+        if signal == "dev_project_update":
+            return "DEV推特更新"
+        if signal == "social_kol_heat":
+            return "社媒热度上升"
+        return "社媒异动"
     if primary_family in (None, "comprehensive"):
         if direction == scoring.POSITIVE:
             return "综合走强"
@@ -2410,8 +2625,6 @@ def format_directional_trigger_title(
         if direction == scoring.MIXED:
             return "信号分化"
         return "综合异动"
-    if primary_family == "social":
-        return _directional_title(direction, "社媒热度上升", "社媒热度下降", "社媒异动")
     if primary_family == "dev":
         return "DEV推特更新"
     return "综合异动"
@@ -2461,7 +2674,26 @@ def _display_fact_lines(display_facts: Any) -> list[str]:
     kol_line = _feed_display_line("KOL", kol)
     if kol_line:
         lines.append(kol_line)
+    social = display_facts.get("social")
+    social_line = _social_display_line(social)
+    if social_line:
+        lines.append(social_line)
     return lines
+
+
+def _social_display_line(fact: Any) -> str | None:
+    if not isinstance(fact, dict) or fact.get("window_minutes") is None:
+        return None
+    unique_kols = int(fact.get("unique_kols") or 0)
+    dev_updates = int(fact.get("meaningful_dev_updates") or 0)
+    if unique_kols <= 0 and dev_updates <= 0:
+        return None
+    parts = [f"• 社媒｜{_format_window(int(fact['window_minutes']))}"]
+    if unique_kols > 0:
+        parts.append(f"KOL+{unique_kols}")
+    if dev_updates > 0:
+        parts.append(f"DEV+{dev_updates}")
+    return " ".join(parts)
 
 
 def _feed_display_line(label: str, fact: Any) -> str | None:

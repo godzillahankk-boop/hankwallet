@@ -19,6 +19,7 @@ HOLDER = "holder"
 SMART_MONEY = "smart_money"
 KOL = "kol"
 LIQUIDITY = "liquidity"
+SOCIAL = "social"
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,30 @@ def kol_score(distinct_traders: int, close_count: int, activity_count: int, call
     if call_count >= 1:
         return 8
     return 0
+
+
+def social_kol_heat_score(distinct_kols: int) -> int:
+    if distinct_kols <= 0:
+        return 0
+    if distinct_kols == 1:
+        return 12
+    if distinct_kols == 2:
+        return 20
+    if distinct_kols == 3:
+        return 28
+    if distinct_kols == 4:
+        return 32
+    if distinct_kols <= 6:
+        return 36
+    return 40
+
+
+def social_dev_update_score(significance: str | None) -> int:
+    return {
+        "low": 15,
+        "medium": 28,
+        "high": 40,
+    }.get((significance or "").lower(), 0)
 
 
 def liquidity_score(current: Decimal | None, baseline: Decimal | None, migration_status: str | None = None) -> int:

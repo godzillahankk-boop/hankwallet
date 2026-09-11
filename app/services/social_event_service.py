@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from sqlalchemy import delete, select
@@ -71,9 +72,16 @@ class SocialMemoryProcessor(Protocol):
 
 
 class SocialEventService:
-    def __init__(self, session_factory: sessionmaker, *, memory_processor: SocialMemoryProcessor | None = None) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        *,
+        memory_processor: SocialMemoryProcessor | None = None,
+        social_update_callback: Callable[[SocialEvent, object | None], None] | None = None,
+    ) -> None:
         self.session_factory = session_factory
         self.memory_processor = memory_processor
+        self.social_update_callback = social_update_callback
 
     def create_event_if_relevant(
         self,
@@ -166,19 +174,32 @@ class SocialEventService:
                     self.upsert_first_mention_if_earlier(session, event)
                 session.expunge(event)
                 created.append(event)
-        self._process_social_memory(created)
+        self._process_social_updates(created)
         return created
 
-    def _process_social_memory(self, events: list[SocialEvent]) -> None:
-        if self.memory_processor is None:
-            return
+    def _process_social_updates(self, events: list[SocialEvent]) -> None:
         for event in events:
-            if event.author_type not in {AUTHOR_PROJECT_X, AUTHOR_DEV_X}:
+            if event.author_type == AUTHOR_KOL:
+                self._notify_social_update(event, None)
                 continue
+            if event.author_type not in {AUTHOR_PROJECT_X, AUTHOR_DEV_X} or self.memory_processor is None:
+                continue
+            memory = None
             try:
-                self.memory_processor.process_event(event)
+                memory = self.memory_processor.process_event(event)
             except Exception as exc:  # noqa: BLE001 - memory triage must not break event ingestion.
                 logger.warning("Social memory processing failed event_id=%s: %s", event.id, str(exc)[:200])
+                continue
+            if memory is not None:
+                self._notify_social_update(event, memory)
+
+    def _notify_social_update(self, event: SocialEvent, memory: object | None) -> None:
+        if self.social_update_callback is None:
+            return
+        try:
+            self.social_update_callback(event, memory)
+        except Exception as exc:  # noqa: BLE001 - social attention trigger must not break ingestion.
+            logger.warning("Social update callback failed event_id=%s: %s", event.id, str(exc)[:200])
 
     def upsert_first_mention_if_earlier(self, session, event: SocialEvent) -> None:
         if event.author_type != AUTHOR_KOL:

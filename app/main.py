@@ -33,6 +33,18 @@ from app.utils.logger import setup_logging
 api_app = FastAPI(title="Wallet Agent", version="0.1.0")
 
 
+def _log_social_attention_future_result(future, *, wallet_id: int, token_address: str, logger: logging.Logger) -> None:  # noqa: ANN001
+    try:
+        future.result()
+    except Exception as exc:  # noqa: BLE001 - async social attention failures must not break ingestion.
+        logger.warning(
+            "Social Attention update failed wallet_id=%s token=%s: %s",
+            wallet_id,
+            token_address,
+            exc,
+        )
+
+
 @dataclass(frozen=True)
 class SocialAutoVerificationComponents:
     profile_provider: TwitterApiIoSocialProfileProvider | None
@@ -120,7 +132,39 @@ async def run() -> None:
                 raise RuntimeError("TWITTERAPI_IO_API_KEY is required when SOCIAL_X_ENABLED=true")
             twitter_client = TwitterApiIoClient(settings.twitterapi_io_api_key)
             social_memory_service = build_social_memory_components(settings, session_factory, logger)
-            social_event_service = SocialEventService(session_factory, memory_processor=social_memory_service)
+            loop = asyncio.get_running_loop()
+
+            def schedule_social_attention(event, memory=None):  # noqa: ANN001
+                if attention_engine_service is None:
+                    return
+                future = asyncio.run_coroutine_threadsafe(
+                    attention_engine_service.handle_social_update(
+                        event.wallet_id,
+                        event.token_address,
+                    ),
+                    loop,
+                )
+                future.add_done_callback(
+                    lambda done, wallet_id=event.wallet_id, token_address=event.token_address: (
+                        _log_social_attention_future_result(
+                            done,
+                            wallet_id=wallet_id,
+                            token_address=token_address,
+                            logger=logger,
+                        )
+                    )
+                )
+
+            social_event_service = SocialEventService(
+                session_factory,
+                memory_processor=social_memory_service,
+                social_update_callback=schedule_social_attention,
+            )
+            if attention_engine_service:
+                attention_engine_service.set_social_services(
+                    social_event_service=social_event_service,
+                    social_memory_service=social_memory_service,
+                )
             social_kol_service = SocialKOLService(session_factory)
             social_kol_service.bootstrap_fixed_kols(settings.social_x_kol_config_path)
             social_registry = SocialWatchRegistry(
