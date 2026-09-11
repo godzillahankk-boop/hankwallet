@@ -46,6 +46,7 @@ from app.services.attention_engine_service import (
     _feed_primary_display_direction,
 )
 from app.services.gmgn_client import GmgnHolder, GmgnMarketSignal, GmgnTokenOverview, GmgnTrackTrade
+from app.services.holding_market_cap import HoldingMarketContext, HoldingMarketContextCache
 from app.services.price_quality import PRICE_QUALITY_OUTLIER, PRICE_QUALITY_PENDING, PRICE_QUALITY_VALID
 from app.services.social_event_service import AUTHOR_DEV_X, AUTHOR_KOL, AUTHOR_PROJECT_X, SocialEventService
 from app.services.social_memory_service import SocialMemoryService
@@ -563,7 +564,13 @@ def notification_assessment(
     kol_score: int = 0,
     liquidity_score: int = 0,
     assessed_at=None,
+    current_price: str | None = None,
+    evidence: dict[str, object] | None = None,
 ) -> AttentionAssessment:
+    evidence = evidence or {"display_facts": {"price": {"window_minutes": 5, "change_pct": "30"}}}
+    if current_price is not None:
+        evidence["current_price"] = current_price
+        evidence["notification_context"] = {"current_price_usd": current_price}
     return AttentionAssessment(
         wallet_id=wallet_id,
         token_address=token,
@@ -592,8 +599,59 @@ def notification_assessment(
         attention_level=level,
         direction=direction,
         should_notify=True,
-        evidence_json=json.dumps({"display_facts": {"price": {"window_minutes": 5, "change_pct": "30"}}}),
+        evidence_json=json.dumps(evidence),
     )
+
+
+def watch_started_at(session_factory, wallet_id: int, token: str = TOKEN) -> datetime:
+    with session_scope(session_factory) as session:
+        started_at = session.scalar(
+            select(TokenWatchState.started_at).where(
+                TokenWatchState.wallet_id == wallet_id,
+                TokenWatchState.token_address == token,
+                TokenWatchState.active.is_(True),
+            )
+        )
+        assert started_at is not None
+        return started_at
+
+
+def add_attention_state(
+    session_factory,
+    wallet_id: int,
+    *,
+    token: str = TOKEN,
+    notified_at: datetime,
+    level: str = scoring.CRITICAL,
+    final_score: int = 77,
+    direction: str = scoring.MIXED,
+    family_scores: dict[str, int] | None = None,
+    last_notified_price: str | None = None,
+    watch_started_at_value: datetime | None = None,
+    last_extreme_at: datetime | None = None,
+) -> None:
+    state_scores: dict[str, object] = dict(family_scores or {scoring.PRICE: 40, scoring.HOLDER: 15, scoring.SMART_MONEY: 10})
+    meta: dict[str, str] = {}
+    if last_notified_price is not None:
+        meta["last_notified_price_usd"] = last_notified_price
+    if watch_started_at_value is not None:
+        meta["watch_started_at"] = watch_started_at_value.isoformat()
+    if last_extreme_at is not None:
+        meta["last_extreme_price_notified_at"] = last_extreme_at.isoformat()
+    if meta:
+        state_scores["_meta"] = meta
+    with session_scope(session_factory) as session:
+        session.add(
+            AttentionAlertState(
+                wallet_id=wallet_id,
+                token_address=token,
+                last_notified_at=notified_at,
+                last_attention_level=level,
+                last_final_score=final_score,
+                last_direction=direction,
+                family_scores_json=json.dumps(state_scores),
+            )
+        )
 
 
 def _test_feed_fact_dict(fact) -> dict[str, object]:
@@ -988,6 +1046,434 @@ def test_repeated_critical_respects_cooldown(ctx) -> None:
             {scoring.PRICE: 40, scoring.SMART_MONEY: 25},
             now + timedelta(minutes=61),
         )
+
+
+def test_continued_extreme_price_replay_zebrafishbrain_triggers_at_1545(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    baseline_at = datetime(2026, 9, 11, 7, 39, 7)
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=baseline_at,
+        last_notified_price="0.000054574895",
+        watch_started_at_value=started_at,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    timeline = [
+        ("2026-09-11 07:40:07", "0.000050872448", False),
+        ("2026-09-11 07:41:07", "0.000051333323", False),
+        ("2026-09-11 07:43:07", "0.000071581978", False),
+        ("2026-09-11 07:44:09", "0.000074012713", False),
+        ("2026-09-11 07:45:07", "0.000087712185", True),
+    ]
+
+    with session_scope(session_factory) as session:
+        for at, price, expected in timeline:
+            decision = service._notification_decision(
+                session,
+                wallet_id,
+                TOKEN,
+                scoring.CRITICAL,
+                77,
+                scoring.MIXED,
+                {scoring.PRICE: 40, scoring.HOLDER: 15, scoring.SMART_MONEY: 10},
+                datetime.fromisoformat(at),
+                current_price_usd=Decimal(price),
+                watch_started_at=started_at,
+            )
+            assert decision.should_notify is expected
+            if expected:
+                assert decision.reason == "continued_extreme_price_move"
+                assert Decimal(decision.notification_context["price_change_since_last_notification_pct"]) >= Decimal("50")
+
+
+@pytest.mark.parametrize(
+    ("current_price", "expected"),
+    [
+        ("1.499", False),
+        ("1.50", True),
+        ("0.501", False),
+        ("0.50", True),
+        ("0.40", True),
+    ],
+)
+def test_continued_extreme_price_threshold_is_symmetric(ctx, current_price: str, expected: bool) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        decision = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            80,
+            scoring.MIXED,
+            {scoring.PRICE: 40},
+            now + timedelta(minutes=5),
+            current_price_usd=Decimal(current_price),
+            watch_started_at=started_at,
+        )
+
+    assert decision.should_notify is expected
+    assert decision.reason == ("continued_extreme_price_move" if expected else "critical_cooldown")
+
+
+def test_continued_extreme_price_requires_critical_and_price_score_40(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        warning = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.WARNING,
+            70,
+            scoring.MIXED,
+            {scoring.PRICE: 40},
+            now + timedelta(minutes=5),
+            current_price_usd=Decimal("1.60"),
+            watch_started_at=started_at,
+        )
+        weak_price = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            80,
+            scoring.MIXED,
+            {scoring.PRICE: 35},
+            now + timedelta(minutes=5),
+            current_price_usd=Decimal("1.60"),
+            watch_started_at=started_at,
+        )
+
+    assert warning.should_notify is False
+    assert warning.reason == "warning_cooldown"
+    assert weak_price.should_notify is False
+    assert weak_price.reason == "critical_cooldown"
+
+
+def test_continued_extreme_price_respects_independent_cooldown_but_not_other_bypasses(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.55",
+        watch_started_at_value=started_at,
+        last_extreme_at=now,
+        family_scores={scoring.PRICE: 40, scoring.HOLDER: 10},
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        price_only = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            80,
+            scoring.MIXED,
+            {scoring.PRICE: 40, scoring.HOLDER: 10},
+            now + timedelta(minutes=3),
+            current_price_usd=Decimal("2.40"),
+            watch_started_at=started_at,
+        )
+        new_strong_family = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            83,
+            scoring.MIXED,
+            {scoring.PRICE: 40, scoring.HOLDER: 35},
+            now + timedelta(minutes=3),
+            current_price_usd=Decimal("2.40"),
+            watch_started_at=started_at,
+        )
+        direction_change = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            80,
+            scoring.NEGATIVE,
+            {scoring.PRICE: 40, scoring.HOLDER: 10},
+            now + timedelta(minutes=3),
+            current_price_usd=Decimal("2.40"),
+            watch_started_at=started_at,
+        )
+
+    assert price_only.should_notify is False
+    assert price_only.reason == "critical_cooldown"
+    assert new_strong_family.should_notify is True
+    assert new_strong_family.reason == "new_strong_family"
+    assert direction_change.should_notify is True
+    assert direction_change.reason == "direction_change"
+
+
+def test_continued_extreme_price_state_is_backward_compatible_and_session_isolated(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    with session_scope(session_factory) as session:
+        session.add(
+            AttentionAlertState(
+                wallet_id=wallet_id,
+                token_address=TOKEN,
+                last_notified_at=now,
+                last_attention_level=scoring.CRITICAL,
+                last_final_score=77,
+                last_direction=scoring.MIXED,
+                family_scores_json=json.dumps({scoring.PRICE: 40, scoring.HOLDER: 15}),
+            )
+        )
+    with session_scope(session_factory) as session:
+        legacy = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            83,
+            scoring.MIXED,
+            {scoring.PRICE: 40, scoring.HOLDER: 35},
+            now + timedelta(minutes=2),
+            current_price_usd=Decimal("1.60"),
+            watch_started_at=started_at,
+        )
+    assert legacy.should_notify is True
+    assert legacy.reason == "new_strong_family"
+
+    with session_scope(session_factory) as session:
+        session.query(AttentionAlertState).delete()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at - timedelta(days=1),
+    )
+    with session_scope(session_factory) as session:
+        new_session = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            80,
+            scoring.MIXED,
+            {scoring.PRICE: 40},
+            now + timedelta(minutes=2),
+            current_price_usd=Decimal("1.60"),
+            watch_started_at=started_at,
+        )
+
+    assert new_session.should_notify is False
+    assert new_session.reason == "critical_cooldown"
+
+
+def test_continued_extreme_price_requires_valid_current_price(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+
+    with session_scope(session_factory) as session:
+        decision = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            80,
+            scoring.MIXED,
+            {scoring.PRICE: 40},
+            now + timedelta(minutes=5),
+            current_price_usd=None,
+            watch_started_at=started_at,
+        )
+
+    assert decision.should_notify is False
+    assert decision.reason == "critical_cooldown"
+
+
+@pytest.mark.asyncio
+async def test_new_session_successful_notification_drops_old_extreme_metadata(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    new_started_at = watch_started_at(session_factory, wallet_id)
+    old_started_at = new_started_at - timedelta(days=1)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=old_started_at,
+        last_extreme_at=now,
+        family_scores={scoring.PRICE: 40, scoring.HOLDER: 10},
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    first_new_session_alert = notification_assessment(
+        wallet_id,
+        final_score=83,
+        level=scoring.CRITICAL,
+        direction=scoring.MIXED,
+        price_score=40,
+        holder_score=35,
+        assessed_at=now + timedelta(minutes=7),
+        current_price="2.00",
+    )
+
+    assert await service._notify_assessment(first_new_session_alert) is True
+
+    with session_scope(session_factory) as session:
+        state = session.scalar(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN))
+        assert state is not None
+        meta = json.loads(state.family_scores_json)["_meta"]
+        assert meta["watch_started_at"] == new_started_at.isoformat()
+        assert meta["last_notified_price_usd"] == "2.00"
+        assert "last_extreme_price_notified_at" not in meta
+
+        followup = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            83,
+            scoring.MIXED,
+            {scoring.PRICE: 40, scoring.HOLDER: 35},
+            now + timedelta(minutes=10),
+            current_price_usd=Decimal("3.10"),
+            watch_started_at=new_started_at,
+        )
+
+    assert followup.should_notify is True
+    assert followup.reason == "continued_extreme_price_move"
+
+
+@pytest.mark.asyncio
+async def test_same_session_successful_notification_preserves_extreme_cooldown(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at,
+        last_extreme_at=now,
+        family_scores={scoring.PRICE: 40, scoring.HOLDER: 10},
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    new_strong_family = notification_assessment(
+        wallet_id,
+        final_score=83,
+        level=scoring.CRITICAL,
+        direction=scoring.MIXED,
+        price_score=40,
+        holder_score=35,
+        assessed_at=now + timedelta(minutes=7),
+        current_price="2.00",
+    )
+
+    assert await service._notify_assessment(new_strong_family) is True
+
+    with session_scope(session_factory) as session:
+        state = session.scalar(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN))
+        assert state is not None
+        meta = json.loads(state.family_scores_json)["_meta"]
+        assert meta.get("last_extreme_price_notified_at") == now.isoformat()
+        followup = service._notification_decision(
+            session,
+            wallet_id,
+            TOKEN,
+            scoring.CRITICAL,
+            83,
+            scoring.MIXED,
+            {scoring.PRICE: 40, scoring.HOLDER: 35},
+            now + timedelta(minutes=10),
+            current_price_usd=Decimal("3.10"),
+            watch_started_at=started_at,
+        )
+
+    assert followup.should_notify is False
+    assert followup.reason == "critical_cooldown"
+
+
+@pytest.mark.asyncio
+async def test_new_session_notification_without_price_drops_old_price_anchor(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    new_started_at = watch_started_at(session_factory, wallet_id)
+    old_started_at = new_started_at - timedelta(days=1)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=old_started_at,
+        last_extreme_at=now,
+        family_scores={scoring.PRICE: 40, scoring.HOLDER: 10},
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    assessment_without_price = notification_assessment(
+        wallet_id,
+        final_score=83,
+        level=scoring.CRITICAL,
+        direction=scoring.MIXED,
+        price_score=40,
+        holder_score=35,
+        assessed_at=now + timedelta(minutes=7),
+    )
+
+    assert await service._notify_assessment(assessment_without_price) is True
+
+    with session_scope(session_factory) as session:
+        state = session.scalar(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN))
+        assert state is not None
+        meta = json.loads(state.family_scores_json)["_meta"]
+        assert meta["watch_started_at"] == new_started_at.isoformat()
+        assert "last_notified_price_usd" not in meta
+        assert "last_extreme_price_notified_at" not in meta
 
 
 def test_abnormality_uses_same_price_window(ctx) -> None:
@@ -1571,8 +2057,9 @@ def test_feed_display_fact_omits_usd_when_incomplete(ctx) -> None:
     text = format_attention_alert(
         make_alert_assessment(evidence={"display_facts": {"smart_money": _test_feed_fact_dict(fact)}})
     )
-    assert "• 聪明钱｜15m +2钱包" in text
-    assert "$" not in text.split("• 聪明钱｜15m +2钱包", 1)[1].splitlines()[0]
+    smart_money_line = next(line for line in text.splitlines() if line.startswith("• 聪明钱｜"))
+    assert smart_money_line == "• 聪明钱｜15m +2钱包"
+    assert "$" not in smart_money_line
 
 
 def test_kol_display_fact_net_wallets_and_usd(ctx) -> None:
@@ -3456,6 +3943,134 @@ async def test_serialized_recheck_still_allows_critical_and_score_upgrade(ctx) -
 
 
 @pytest.mark.asyncio
+async def test_serialized_recheck_allows_extreme_price_and_marks_anchor(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at,
+    )
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, notify)
+    assessment = notification_assessment(
+        wallet_id,
+        final_score=80,
+        level=scoring.CRITICAL,
+        direction=scoring.MIXED,
+        price_score=40,
+        assessed_at=now + timedelta(minutes=5),
+        current_price="1.55",
+    )
+
+    assert await service._notify_assessment(assessment) is True
+
+    with session_scope(session_factory) as session:
+        state = session.scalar(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN))
+        assert state is not None
+        state_json = json.loads(state.family_scores_json)
+        meta = state_json["_meta"]
+        assert meta["last_notified_price_usd"] == "1.55"
+        assert meta["watch_started_at"] == started_at.isoformat()
+        assert meta.get("last_extreme_price_notified_at")
+
+
+@pytest.mark.asyncio
+async def test_extreme_price_delivery_failure_does_not_update_anchor(monkeypatch, ctx) -> None:
+    monkeypatch.setattr(
+        "app.services.attention_engine_service.ATTENTION_NOTIFICATION_RETRY_DELAYS_SECONDS",
+        (0, 0, 0),
+    )
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at,
+    )
+
+    async def fail(chat_id: int, text: str, reply_markup=None) -> None:
+        raise RuntimeError("telegram_down")
+
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, fail)
+    assessment = notification_assessment(
+        wallet_id,
+        final_score=80,
+        level=scoring.CRITICAL,
+        direction=scoring.MIXED,
+        price_score=40,
+        assessed_at=now + timedelta(minutes=5),
+        current_price="1.55",
+    )
+
+    with pytest.raises(RuntimeError, match="telegram_down"):
+        await service._notify_assessment(assessment)
+
+    with session_scope(session_factory) as session:
+        state = session.scalar(select(AttentionAlertState).where(AttentionAlertState.token_address == TOKEN))
+        assert state is not None
+        meta = json.loads(state.family_scores_json)["_meta"]
+        assert meta["last_notified_price_usd"] == "1.00"
+        assert "last_extreme_price_notified_at" not in meta
+
+
+@pytest.mark.asyncio
+async def test_concurrent_extreme_price_notifications_are_serialized(ctx) -> None:
+    app_settings, session_factory, sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id)
+    started_at = watch_started_at(session_factory, wallet_id)
+    now = utc_now()
+    add_attention_state(
+        session_factory,
+        wallet_id,
+        notified_at=now,
+        last_notified_price="1.00",
+        watch_started_at_value=started_at,
+    )
+    calls = 0
+
+    async def slow_notify(chat_id: int, text: str, reply_markup=None) -> None:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        sent.append((chat_id, text))
+
+    service = AttentionEngineService(session_factory, FakeAttentionGmgn(), app_settings, slow_notify)
+    first = notification_assessment(
+        wallet_id,
+        final_score=80,
+        level=scoring.CRITICAL,
+        direction=scoring.MIXED,
+        price_score=40,
+        assessed_at=now + timedelta(minutes=5),
+        current_price="1.55",
+    )
+    second = notification_assessment(
+        wallet_id,
+        final_score=80,
+        level=scoring.CRITICAL,
+        direction=scoring.MIXED,
+        price_score=40,
+        assessed_at=now + timedelta(minutes=5, seconds=1),
+        current_price="1.55",
+    )
+
+    results = await asyncio.gather(service._notify_assessment(first), service._notify_assessment(second))
+
+    assert results.count(True) == 1
+    assert results.count(False) == 1
+    assert calls == 1
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_different_token_notifications_do_not_share_global_lock(ctx) -> None:
     app_settings, session_factory, sent, notify, wallet_id = ctx
     add_watched(session_factory, wallet_id, token=TOKEN, symbol="WINK")
@@ -3670,6 +4285,8 @@ def test_format_attention_alert_removes_redundant_title_and_internal_level() -> 
     assert "• KOL｜15m +2钱包 +$1.2k" in text
     assert "• 流动性｜1h -3.2%" in text
     assert "判断：当前主要是价格异动，暂未看到明显结构共振。" in text
+    assert "当前仅提示异动事实，不构成交易建议。" not in text
+    assert text == text.rstrip()
     assert "暂无明显结构变化：" not in text
     assert text.index("• 价格｜5m +17.9%") < text.index("• 流动性｜1h -3.2%")
     assert text.index("• 流动性｜1h -3.2%") < text.index("• 持仓人数｜30m +8.4%")
@@ -3692,6 +4309,47 @@ def test_format_attention_alert_direction_emoji_is_explicit(direction, expected_
     text = format_attention_alert(make_alert_assessment(direction=direction))
 
     assert text.splitlines()[0].startswith(f"{expected_emoji} $ROBBIE")
+
+
+def test_format_attention_alert_shows_frozen_market_cap_context() -> None:
+    text = format_attention_alert(
+        make_alert_assessment(
+            symbol="WORMBRAIN",
+            evidence={
+                "primary_direction": scoring.POSITIVE,
+                "display_facts": {"price": {"window_minutes": 15, "change_pct": "99"}},
+                "market_cap_context": {
+                    "entry_market_cap_usd": "50000",
+                    "current_market_cap_usd": "75000",
+                },
+            },
+        )
+    )
+
+    assert text.startswith("🟠 WORMBRAIN\n持仓市值：50k ｜ 当前市值：75k\n\n")
+
+
+def test_format_attention_alert_shows_missing_entry_market_cap() -> None:
+    text = format_attention_alert(
+        make_alert_assessment(
+            evidence={
+                "primary_direction": scoring.POSITIVE,
+                "display_facts": {"price": {"window_minutes": 15, "change_pct": "99"}},
+                "market_cap_context": {
+                    "entry_market_cap_usd": None,
+                    "current_market_cap_usd": "75000",
+                },
+            },
+        )
+    )
+
+    assert "持仓市值：-- ｜ 当前市值：75k" in text
+
+
+def test_format_attention_alert_omits_missing_market_cap_context() -> None:
+    text = format_attention_alert(make_alert_assessment())
+
+    assert "持仓市值：" not in text
 
 
 def test_format_attention_alert_orders_display_facts_and_omits_missing() -> None:
@@ -3720,6 +4378,119 @@ def test_format_attention_alert_orders_display_facts_and_omits_missing() -> None
     assert price_index < liquidity_index < top10_index < smart_index
     assert "持仓人数" not in text
     assert "KOL｜" not in text
+
+
+@pytest.mark.asyncio
+async def test_assessment_freezes_fresh_market_cap_context(ctx) -> None:
+    app_settings, session_factory, _sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, usd_value="50", symbol="WORMBRAIN")
+    started_at = watch_started_at(session_factory, wallet_id)
+    cache = HoldingMarketContextCache()
+    cache.set(
+        HoldingMarketContext(
+            wallet_id=wallet_id,
+            token_address=TOKEN,
+            current_market_cap_usd=Decimal("75000"),
+            entry_market_cap_usd=Decimal("50000"),
+            effective_avg_cost_usd=Decimal("0.00005"),
+            current_price_usd=Decimal("0.000075"),
+            total_supply=Decimal("1000000000"),
+            observed_at=utc_now(),
+            watch_started_at=started_at,
+        )
+    )
+    service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        market_context_cache=cache,
+    )
+
+    assessment = await service.assess_token(wallet_id, TOKEN)
+
+    assert assessment is not None
+    evidence = json.loads(assessment.evidence_json)
+    assert evidence["market_cap_context"]["entry_market_cap_usd"] == "50000"
+    assert evidence["market_cap_context"]["current_market_cap_usd"] == "75000"
+    assert "持仓市值：50k ｜ 当前市值：75k" in format_attention_alert(assessment)
+
+    cache.set(
+        HoldingMarketContext(
+            wallet_id=wallet_id,
+            token_address=TOKEN,
+            current_market_cap_usd=Decimal("999000"),
+            entry_market_cap_usd=Decimal("888000"),
+            effective_avg_cost_usd=Decimal("0.000888"),
+            current_price_usd=Decimal("0.000999"),
+            total_supply=Decimal("1000000000"),
+            observed_at=utc_now(),
+            watch_started_at=started_at,
+        )
+    )
+    assert "持仓市值：50k ｜ 当前市值：75k" in format_attention_alert(assessment)
+
+
+@pytest.mark.asyncio
+async def test_assessment_omits_stale_or_wrong_session_market_cap_context(ctx) -> None:
+    app_settings, session_factory, _sent, notify, wallet_id = ctx
+    add_watched(session_factory, wallet_id, usd_value="50", symbol="WORMBRAIN")
+    started_at = watch_started_at(session_factory, wallet_id)
+    stale_cache = HoldingMarketContextCache()
+    stale_cache.set(
+        HoldingMarketContext(
+            wallet_id=wallet_id,
+            token_address=TOKEN,
+            current_market_cap_usd=Decimal("75000"),
+            entry_market_cap_usd=Decimal("50000"),
+            effective_avg_cost_usd=Decimal("0.00005"),
+            current_price_usd=Decimal("0.000075"),
+            total_supply=Decimal("1000000000"),
+            observed_at=utc_now() - timedelta(seconds=181),
+            watch_started_at=started_at,
+        )
+    )
+    stale_service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        market_context_cache=stale_cache,
+    )
+
+    stale_assessment = await stale_service.assess_token(wallet_id, TOKEN)
+
+    assert stale_assessment is not None
+    assert json.loads(stale_assessment.evidence_json)["market_cap_context"] is None
+    assert "持仓市值：" not in format_attention_alert(stale_assessment)
+
+    mismatch_cache = HoldingMarketContextCache()
+    mismatch_cache.set(
+        HoldingMarketContext(
+            wallet_id=wallet_id,
+            token_address=TOKEN,
+            current_market_cap_usd=Decimal("75000"),
+            entry_market_cap_usd=Decimal("50000"),
+            effective_avg_cost_usd=Decimal("0.00005"),
+            current_price_usd=Decimal("0.000075"),
+            total_supply=Decimal("1000000000"),
+            observed_at=utc_now(),
+            watch_started_at=started_at - timedelta(hours=1),
+        )
+    )
+    mismatch_service = AttentionEngineService(
+        session_factory,
+        FakeAttentionGmgn(),
+        app_settings,
+        notify,
+        market_context_cache=mismatch_cache,
+    )
+
+    mismatch_assessment = await mismatch_service.assess_token(wallet_id, TOKEN)
+
+    assert mismatch_assessment is not None
+    assert json.loads(mismatch_assessment.evidence_json)["market_cap_context"] is None
+    assert "持仓市值：" not in format_attention_alert(mismatch_assessment)
 
 
 @pytest.mark.parametrize(

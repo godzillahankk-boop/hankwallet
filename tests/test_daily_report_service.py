@@ -427,6 +427,7 @@ def test_no_trades_report_message(tmp_path) -> None:
 def test_main_menu_contains_daily_report_button() -> None:
     keyboard = main_menu_keyboard()
 
+    assert BTN_DAILY_REPORT == "📊 查看昨日日报（待）"
     assert any(button.text == BTN_DAILY_REPORT for row in keyboard.keyboard for button in row)
 
 
@@ -455,4 +456,12 @@ async def test_daily_report_handler_replies_without_sending_telegram_push(tmp_pa
     await daily_report(update, context)
 
     assert len(message.replies) == 1
-    assert message.replies[0][0].startswith("📊 昨日日报")
+    assert message.replies[0][0] == "📊 昨日日报功能开发中，暂未正式上线。"
+
+
+def test_daily_report_business_code_remains_available(tmp_path) -> None:
+    _, _, service = make_ctx(tmp_path)
+
+    report = service.build_yesterday_report([])
+
+    assert format_daily_report(report).startswith("📊 昨日日报")

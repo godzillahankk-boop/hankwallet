@@ -14,6 +14,7 @@ from app.db.database import init_db, make_engine, make_session_factory
 from app.services.chain_client import build_chain_client
 from app.services.attention_engine_service import AttentionEngineService
 from app.services.gmgn_client import GmgnClient
+from app.services.holding_market_cap import HoldingMarketContextCache
 from app.services.monitoring_service import MonitoringService
 from app.services.price_guardian_service import PriceGuardianService
 from app.services.social_discovery_service import SocialDiscoveryService
@@ -105,12 +106,14 @@ async def run() -> None:
                 gmgn_client.min_request_interval_seconds,
                 1.0,
             )
+            market_context_cache = HoldingMarketContextCache()
             if settings.attention_engine_enabled:
                 attention_engine_service = AttentionEngineService(
                     session_factory=session_factory,
                     gmgn_client=gmgn_client,
                     settings=settings,
                     notifier=notify,
+                    market_context_cache=market_context_cache,
                 )
             if settings.price_guardian_enabled:
                 price_guardian_service = PriceGuardianService(
@@ -121,6 +124,7 @@ async def run() -> None:
                     price_attention_trigger=attention_engine_service.handle_price_snapshot_update
                     if attention_engine_service
                     else None,
+                    market_context_cache=market_context_cache,
                 )
         except Exception as exc:
             logger.exception("GMGN error GMGN-backed services disabled during startup: %s", exc)

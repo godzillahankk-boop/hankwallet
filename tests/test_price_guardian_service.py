@@ -14,6 +14,7 @@ from app.db.database import init_db, make_engine, make_session_factory, session_
 from app.db.models import AttentionAlertState, AttentionAssessment, PriceAlertState, PriceSnapshot, TokenWatchState
 from app.services.attention_engine_service import AttentionEngineService
 from app.services.gmgn_client import GmgnPage, parse_holding
+from app.services.holding_market_cap import HoldingMarketContextCache
 from app.services.price_guardian_service import (
     DOWN,
     UP,
@@ -164,6 +165,19 @@ def make_service(session_factory, app_settings, gmgn_client, sent):
     return PriceGuardianService(session_factory, gmgn_client, app_settings, notify)
 
 
+def make_service_with_market_cache(session_factory, app_settings, gmgn_client, sent, cache):
+    async def notify(chat_id: int, text: str) -> None:
+        sent.append((chat_id, text))
+
+    return PriceGuardianService(
+        session_factory,
+        gmgn_client,
+        app_settings,
+        notify,
+        market_context_cache=cache,
+    )
+
+
 def make_failing_service(session_factory, app_settings, gmgn_client):
     async def notify(chat_id: int, text: str) -> None:
         raise RuntimeError("telegram_down")
@@ -193,6 +207,7 @@ def holding(
     usd_value: str | None = "57.08",
     buys: int = 1,
     unrealized_profit: str | None = "7.08",
+    total_supply: str | None = "1000000000",
 ) -> dict:
     item = {
         "balance": balance,
@@ -209,6 +224,8 @@ def holding(
     }
     if price is not None:
         item["token"]["price"] = price
+    if total_supply is not None:
+        item["token"]["total_supply"] = total_supply
     if usd_value is not None:
         item["usd_value"] = usd_value
     if unrealized_profit is not None:
@@ -373,6 +390,94 @@ async def test_holding_auto_enters_monitor_and_new_holding_records_snapshot(serv
         watches = list(session.scalars(select(TokenWatchState)))
     assert len(watches) == 1
     assert watches[0].active is True
+
+
+@pytest.mark.asyncio
+async def test_valid_price_snapshot_updates_market_context_cache(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    cache = HoldingMarketContextCache()
+    gmgn = FakeGmgnClient(
+        {
+            WALLET: [
+                holding(
+                    symbol="WORMBRAIN",
+                    price="0.000075",
+                    balance="2000000",
+                    usd_value="150",
+                    unrealized_profit="50",
+                    total_supply="1000000000",
+                )
+            ]
+        }
+    )
+    service = make_service_with_market_cache(session_factory, app_settings, gmgn, sent, cache)
+
+    await service.scan_wallet(wallet_id)
+
+    with session_scope(session_factory) as session:
+        watch = session.scalar(select(TokenWatchState).where(TokenWatchState.token_address == TOKEN))
+        assert watch is not None
+    context = cache.get(
+        wallet_id,
+        TOKEN,
+        watch_started_at=watch.started_at,
+        now=utc_now(),
+        max_age_seconds=300,
+    )
+    assert context is not None
+    assert context.current_market_cap_usd == Decimal("75000.000000")
+    assert context.entry_market_cap_usd == Decimal("50000.00000")
+
+
+@pytest.mark.asyncio
+async def test_pending_or_outlier_snapshot_does_not_update_market_context_cache(service_ctx) -> None:
+    app_settings, session_factory, sent, wallet_id, _ = service_ctx
+    cache = HoldingMarketContextCache()
+    gmgn = FakeGmgnClient(
+        {
+            WALLET: [
+                holding(
+                    price="0.0002",
+                    usd_value="57.08",
+                    unrealized_profit="7.08",
+                    total_supply="1000000000",
+                )
+            ]
+        }
+    )
+    service = make_service_with_market_cache(session_factory, app_settings, gmgn, sent, cache)
+    await service.scan_wallet(wallet_id)
+    with session_scope(session_factory) as session:
+        watch = session.scalar(select(TokenWatchState).where(TokenWatchState.token_address == TOKEN))
+        assert watch is not None
+    before = cache.get(
+        wallet_id,
+        TOKEN,
+        watch_started_at=watch.started_at,
+        now=utc_now(),
+        max_age_seconds=300,
+    )
+    assert before is not None
+
+    gmgn.holdings_by_wallet[WALLET] = [
+        holding(
+            price="0.01",
+            usd_value="2490.45",
+            unrealized_profit="2440.45",
+            total_supply="1000000000",
+        )
+    ]
+    await service.scan_wallet(wallet_id)
+
+    after = cache.get(
+        wallet_id,
+        TOKEN,
+        watch_started_at=watch.started_at,
+        now=utc_now(),
+        max_age_seconds=300,
+    )
+    assert after is not None
+    assert after.current_market_cap_usd == before.current_market_cap_usd
 
 
 @pytest.mark.asyncio

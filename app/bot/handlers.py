@@ -21,6 +21,7 @@ from app.bot.keyboards import (
     BTN_DAILY_REPORT,
     BTN_DELETE_WALLET,
     BTN_LIST_WALLETS,
+    BTN_NEW_WALLET,
     BTN_POSITIONS,
     BTN_SCAN,
     BTN_SETTINGS,
@@ -59,6 +60,32 @@ ADDING_WALLET = 1
 DELETING_WALLET = 2
 
 
+def _user_has_active_wallet(context: ContextTypes.DEFAULT_TYPE, telegram_user_id: int) -> bool:
+    session_factory = context.application.bot_data["session_factory"]
+    with session_scope(session_factory) as session:
+        user = session.scalar(select(User).where(User.telegram_user_id == telegram_user_id))
+        if not user:
+            return False
+        return (
+            session.scalar(
+                select(Wallet.id).where(
+                    Wallet.user_id == user.id,
+                    Wallet.is_active.is_(True),
+                )
+            )
+            is not None
+        )
+
+
+def _main_menu_keyboard_for_user(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_user_id: int | None,
+):
+    if telegram_user_id is None:
+        return main_menu_keyboard()
+    return main_menu_keyboard(has_wallet=_user_has_active_wallet(context, telegram_user_id))
+
+
 def build_application(
     settings: Settings,
     session_factory: sessionmaker,
@@ -79,6 +106,7 @@ def build_application(
     application.add_handler(
         ConversationHandler(
             entry_points=[
+                MessageHandler(filters.Regex(f"^{BTN_NEW_WALLET}$"), add_wallet_start),
                 MessageHandler(filters.Regex(f"^{BTN_ADD_WALLET}$"), add_wallet_start),
                 MessageHandler(filters.Regex(f"^{BTN_DELETE_WALLET}$"), delete_wallet_start),
             ],
@@ -112,7 +140,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         WalletService(session).get_or_create_user(
             update.effective_user.id, update.effective_chat.id
         )
-    await update.message.reply_text(START_MESSAGE, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(
+        START_MESSAGE,
+        reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
+    )
 
 
 async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -145,16 +176,18 @@ async def add_wallet_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except ValueError as exc:
         if str(exc) == "wallet_already_exists":
             await update.message.reply_text(
-                duplicate_wallet_message(), reply_markup=main_menu_keyboard()
+                duplicate_wallet_message(),
+                reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
             )
         else:
             await update.message.reply_text(
-                invalid_wallet_message(), reply_markup=main_menu_keyboard()
+                invalid_wallet_message(),
+                reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
             )
         return ConversationHandler.END
 
     await update.message.reply_text(
-        wallet_added_message(wallet_address), reply_markup=main_menu_keyboard()
+        wallet_added_message(wallet_address), reply_markup=main_menu_keyboard(has_wallet=True)
     )
     context.application.create_task(
         _run_gmgn_first_scan(context.application, wallet_id, update.effective_chat.id)
@@ -171,7 +204,7 @@ async def _run_gmgn_first_scan(application, wallet_id: int, chat_id: int) -> Non
         await application.bot.send_message(
             chat_id=chat_id,
             text=gmgn_scan_failure_message(),
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(has_wallet=True),
         )
         return
     try:
@@ -185,7 +218,7 @@ async def _run_gmgn_first_scan(application, wallet_id: int, chat_id: int) -> Non
         await application.bot.send_message(
             chat_id=chat_id,
             text=gmgn_scan_failure_message(),
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(has_wallet=True),
         )
         return
     if result.errors:
@@ -193,13 +226,13 @@ async def _run_gmgn_first_scan(application, wallet_id: int, chat_id: int) -> Non
         await application.bot.send_message(
             chat_id=chat_id,
             text=gmgn_scan_failure_message(),
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(has_wallet=True),
         )
         return
     await application.bot.send_message(
         chat_id=chat_id,
         text=gmgn_first_scan_done_message(result, settings.price_monitor_min_usd_value),
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(has_wallet=True),
     )
 
 
@@ -235,7 +268,10 @@ async def delete_wallet_finish(update: Update, context: ContextTypes.DEFAULT_TYP
             settings.default_chain,
         )
     text = "✅ 钱包已删除。" if removed else "没有找到这个钱包。"
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(
+        text,
+        reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
+    )
     return ConversationHandler.END
 
 
@@ -281,13 +317,16 @@ async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 settings.price_monitor_min_usd_value,
                 settings.price_excluded_symbols,
             )
-            await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+            await update.message.reply_text(
+                text,
+                reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
+            )
             return
         except Exception as exc:
             logger.exception("GMGN holdings refresh failed for positions view: %s", exc)
             await update.message.reply_text(
                 "\n".join(["⚠️ GMGN 持仓刷新失败", "", str(exc)]),
-                reply_markup=main_menu_keyboard(),
+                reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
             )
             return
     with session_scope(session_factory) as session:
@@ -303,7 +342,10 @@ async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ]
     if balances:
         text = balances_message(balances)
-        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            text,
+            reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
+        )
         for wallet_id in stale_wallet_ids:
             context.application.create_task(
                 _refresh_wallet_balances_safely(monitoring_service, wallet_id)
@@ -316,13 +358,16 @@ async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.exception("Wallet balance refresh failed wallet_id=%s: %s", wallet_id, exc)
             await update.message.reply_text(
                 "\n".join(["⚠️ 持仓刷新失败", "", str(exc)]),
-                reply_markup=main_menu_keyboard(),
+                reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
             )
             return
     with session_scope(session_factory) as session:
         balances = BalanceService(session).list_user_balances(update.effective_user.id)
         text = balances_message(balances)
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(
+        text,
+        reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
+    )
 
 
 async def fetch_gmgn_position_holdings(
@@ -354,7 +399,7 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if now - last_scan_at < settings.manual_scan_cooldown_seconds:
         await update.message.reply_text(
             f"手动扫描太频繁，请 {settings.manual_scan_cooldown_seconds} 秒后再试。",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
         )
         return
     last_by_user[update.effective_user.id] = now
@@ -366,7 +411,7 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not price_guardian_service:
         await update.message.reply_text(
             gmgn_scan_failure_message(),
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
         )
         return
     wallet_ids: list[int] = []
@@ -392,7 +437,7 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if result.errors:
             await update.message.reply_text(
                 gmgn_scan_failure_message(),
-                reply_markup=main_menu_keyboard(),
+                reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
             )
             return
         total.wallets_scanned += result.wallets_scanned
@@ -407,27 +452,31 @@ async def manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await update.message.reply_text(
         gmgn_manual_scan_done_message(total, settings.price_monitor_min_usd_value),
-        reply_markup=main_menu_keyboard(),
+        reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
     )
 
 
 async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
+    if not update.message:
         return
-    settings: Settings = context.application.bot_data["settings"]
-    session_factory = context.application.bot_data["session_factory"]
-    service = DailyReportService(
-        session_factory,
-        report_timezone=settings.report_timezone,
-        price_tolerance_minutes=settings.daily_report_price_tolerance_minutes,
+    await update.message.reply_text(
+        "📊 昨日日报功能开发中，暂未正式上线。",
+        reply_markup=_main_menu_keyboard_for_user(
+            context,
+            update.effective_user.id if update.effective_user else None,
+        ),
     )
-    report = service.build_yesterday_report_for_telegram_user(update.effective_user.id)
-    await update.message.reply_text(format_daily_report(report), reply_markup=main_menu_keyboard())
 
 
 async def settings_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
-        await update.message.reply_text(SETTINGS_MESSAGE, reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            SETTINGS_MESSAGE,
+            reply_markup=_main_menu_keyboard_for_user(
+                context,
+                update.effective_user.id if update.effective_user else None,
+            ),
+        )
 
 
 async def attention_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -439,14 +488,14 @@ async def attention_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not attention_engine_service:
         await update.message.reply_text(
             "Attention Engine 当前未启用。",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
         )
         return
     symbol = " ".join(context.args).strip() if context.args else ""
     if not symbol:
         await update.message.reply_text(
             "请输入：/attention SYMBOL",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
         )
         return
     assessments = attention_engine_service.latest_assessment_for_symbol(
@@ -456,24 +505,33 @@ async def attention_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not assessments:
         await update.message.reply_text(
             f"没有找到 {symbol.upper()} 的 Attention 评估。",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
         )
         return
     if len(assessments) > 1:
         lines = [f"{symbol.upper()} 匹配到多个持仓，请使用更明确的Symbol后再试。", ""]
         for assessment in assessments[:5]:
             lines.append(f"{assessment.symbol or '-'} {assessment.token_address}")
-        await update.message.reply_text("\n".join(lines), reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
+        )
         return
     await update.message.reply_text(
         format_attention_debug(assessments[0]),
-        reply_markup=main_menu_keyboard(),
+        reply_markup=_main_menu_keyboard_for_user(context, update.effective_user.id),
     )
 
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message:
-        await update.message.reply_text(START_MESSAGE, reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            START_MESSAGE,
+            reply_markup=_main_menu_keyboard_for_user(
+                context,
+                update.effective_user.id if update.effective_user else None,
+            ),
+        )
     return ConversationHandler.END
 
 
@@ -482,5 +540,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     if isinstance(update, Update) and update.message:
         await update.message.reply_text(
             "⚠️ 系统处理失败，请稍后再试。",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_main_menu_keyboard_for_user(
+                context,
+                update.effective_user.id if update.effective_user else None,
+            ),
         )

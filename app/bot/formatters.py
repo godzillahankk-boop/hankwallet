@@ -27,6 +27,16 @@ def format_holding_usd(value: Decimal | None) -> str:
     return f"${_one_decimal(value):,}"
 
 
+def format_market_cap(value: Decimal | str | None) -> str:
+    decimal_value = decimal_or_none(value)
+    if decimal_value is None:
+        return "--"
+    abs_value = abs(decimal_value)
+    if abs_value < Decimal("1000000"):
+        return f"{_trim_decimal(decimal_value / Decimal('1000'), Decimal('0.1'))}k"
+    return f"{_trim_decimal(decimal_value / Decimal('1000000'), Decimal('0.01'))}m"
+
+
 def holding_pnl_pct(
     usd_value: Decimal | None,
     unrealized_profit: Decimal | None,
@@ -53,3 +63,10 @@ def format_holding_pnl_pct(
 
 def _one_decimal(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+
+
+def _trim_decimal(value: Decimal, quantum: Decimal) -> str:
+    text = f"{value.quantize(quantum, rounding=ROUND_HALF_UP):f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text

@@ -7,6 +7,7 @@ from app.bot.formatters import (
     format_holding_pnl_pct,
     format_holding_quantity,
     format_holding_usd,
+    format_market_cap,
 )
 from app.bot.messages import balances_message, gmgn_holdings_message
 from app.services.gmgn_client import parse_holding
@@ -56,8 +57,8 @@ def test_balances_message_uses_readable_holding_format() -> None:
             "💼 当前持仓",
             "",
             "🟢 PONS",
-            "数量：164.3",
             "金额：$19.4",
+            "持仓市值：--",
             "持仓盈亏：--",
         ]
     )
@@ -71,6 +72,8 @@ def gmgn_holding(
     unrealized_profit: str | None = "4.39786911",
     buys: int = 1,
     realized_profit: str | None = "999",
+    price: str | None = "0.000075",
+    total_supply: str | None = "1000000000",
 ):
     item = {
         "balance": balance,
@@ -84,6 +87,10 @@ def gmgn_holding(
             "decimals": 18,
         },
     }
+    if price is not None:
+        item["token"]["price"] = price
+    if total_supply is not None:
+        item["token"]["total_supply"] = total_supply
     if unrealized_profit is not None:
         item["unrealized_profit"] = unrealized_profit
     if realized_profit is not None:
@@ -116,8 +123,8 @@ def test_gmgn_holdings_message_shows_buy_position_with_unrealized_pnl() -> None:
             "💼 当前持仓",
             "",
             "🟢 PONS",
-            "数量：164.3",
             "金额：$19.4",
+            "持仓市值：91.32m",
             "持仓盈亏：+29.3%",
         ]
     )
@@ -173,10 +180,45 @@ def test_gmgn_holdings_message_unknown_usd_value_is_not_hidden_below_threshold()
 
 
 def test_gmgn_holdings_message_displays_without_current_price_when_usd_value_is_enough() -> None:
-    text = gmgn_holdings_message([gmgn_holding(symbol="NOPRICE", usd_value="20")], Decimal("5"))
+    text = gmgn_holdings_message(
+        [gmgn_holding(symbol="NOPRICE", usd_value="20", price=None)],
+        Decimal("5"),
+    )
 
     assert "🟢 NOPRICE" in text
     assert "金额：$20.0" in text
+    assert "持仓市值：--" in text
+
+
+def test_gmgn_holdings_message_omits_quantity_and_shows_entry_market_cap() -> None:
+    text = gmgn_holdings_message(
+        [
+            gmgn_holding(
+                symbol="WORMBRAIN",
+                balance="2000000",
+                usd_value="150",
+                unrealized_profit="50",
+                price="0.000075",
+                total_supply="1000000000",
+            )
+        ],
+        Decimal("5"),
+    )
+
+    assert "数量：" not in text
+    assert "金额：$150.0" in text
+    assert "持仓市值：50k" in text
+    assert "持仓盈亏：+50.0%" in text
+
+
+def test_format_market_cap() -> None:
+    assert format_market_cap(Decimal("50000")) == "50k"
+    assert format_market_cap(Decimal("75500")) == "75.5k"
+    assert format_market_cap(Decimal("999900")) == "999.9k"
+    assert format_market_cap(Decimal("1000000")) == "1m"
+    assert format_market_cap(Decimal("1250000")) == "1.25m"
+    assert format_market_cap(Decimal("12800000")) == "12.8m"
+    assert format_market_cap(None) == "--"
 
 
 def test_gmgn_holdings_message_all_trading_positions_below_threshold() -> None:

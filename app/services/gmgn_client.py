@@ -96,6 +96,7 @@ class GmgnHolding:
     last_active_time: int | None
     raw: dict[str, Any] = field(repr=False)
     price_source_field: str | None = None
+    total_supply: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -722,6 +723,7 @@ def parse_holding(chain: str, item: dict[str, Any]) -> GmgnHolding:
         last_active_time=_int_or_none(_first(item, token, "last_active_timestamp", "last_active_time", "last_trade_timestamp")),
         raw=item,
         price_source_field=price_source_field,
+        total_supply=_decimal_or_none(_first(token, item, "total_supply", "supply")),
     )
 
 

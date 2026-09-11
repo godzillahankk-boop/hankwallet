@@ -5,8 +5,8 @@ from decimal import Decimal
 from app.bot.formatters import (
     decimal_or_none,
     format_holding_pnl_pct,
-    format_holding_quantity,
     format_holding_usd,
+    format_market_cap,
 )
 from app.db.models import Position, Wallet, WalletTokenBalance
 from app.services.gmgn_client import GmgnHolding
@@ -15,6 +15,7 @@ from app.services.holding_classifier import (
     is_canonical_trading_position,
     is_display_position,
 )
+from app.services.holding_market_cap import build_holding_market_context
 from app.services.price_guardian_service import PriceGuardianResult
 from app.utils.address import short_address
 
@@ -79,8 +80,8 @@ def balances_message(balances: list[WalletTokenBalance]) -> str:
         usd_value = decimal_or_none(balance.usd_value)
         unrealized_profit = decimal_or_none(getattr(balance, "unrealized_profit", None))
         lines.append(f"🟢 {symbol}")
-        lines.append(f"数量：{format_holding_quantity(amount)}")
         lines.append(f"金额：{format_holding_usd(usd_value)}")
+        lines.append("持仓市值：--")
         lines.append(f"持仓盈亏：{format_holding_pnl_pct(usd_value, unrealized_profit)}")
         lines.append("")
     return "\n".join(lines).strip()
@@ -117,9 +118,21 @@ def gmgn_holdings_message(
         return "\n".join(lines).strip()
     for holding in display_holdings:
         symbol = holding.symbol or short_address(holding.contract_address or "")
+        market_context = build_holding_market_context(
+            wallet_id=0,
+            token_address=holding.contract_address or "",
+            holding=holding,
+            observed_at=None,
+            watch_started_at=None,
+        )
         lines.append(f"🟢 {symbol}")
-        lines.append(f"数量：{format_holding_quantity(holding.balance)}")
         lines.append(f"金额：{format_holding_usd(holding.usd_value)}")
+        lines.append(
+            "持仓市值："
+            + format_market_cap(
+                market_context.entry_market_cap_usd if market_context else None
+            )
+        )
         lines.append(
             f"持仓盈亏：{format_holding_pnl_pct(holding.usd_value, holding.unrealized_profit_usd)}"
         )

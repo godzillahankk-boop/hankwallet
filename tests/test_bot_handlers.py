@@ -5,7 +5,16 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from app.bot.handlers import add_wallet_finish, fetch_gmgn_position_holdings, manual_scan
+from app.bot.handlers import (
+    ADDING_WALLET,
+    add_wallet_finish,
+    add_wallet_start,
+    delete_wallet_finish,
+    fetch_gmgn_position_holdings,
+    manual_scan,
+    start,
+)
+from app.bot.keyboards import BTN_ADD_WALLET, BTN_DAILY_REPORT, BTN_NEW_WALLET, BTN_WALLETS
 from app.core.config import Settings
 from app.db.database import init_db, make_engine, make_session_factory, session_scope
 from app.db.models import Wallet
@@ -78,9 +87,11 @@ class FakeMessage:
     def __init__(self, text: str) -> None:
         self.text = text
         self.replies: list[str] = []
+        self.reply_markups = []
 
     async def reply_text(self, text: str, **kwargs) -> None:
         self.replies.append(text)
+        self.reply_markups.append(kwargs.get("reply_markup"))
 
 
 class FakeUpdate:
@@ -112,6 +123,10 @@ class FakeApplication:
 class FakeContext:
     def __init__(self, application: FakeApplication) -> None:
         self.application = application
+
+
+def keyboard_labels(markup) -> list[str]:
+    return [button.text for row in markup.keyboard for button in row]
 
 
 class FakeMonitoringService:
@@ -200,6 +215,107 @@ def handler_ctx(tmp_path):
         }
     )
     return app_settings, session_factory, monitoring, price_guardian, app, FakeContext(app)
+
+
+@pytest.mark.asyncio
+async def test_start_menu_uses_new_wallet_button_when_user_has_no_wallet(handler_ctx) -> None:
+    _, _, _, _, _, context = handler_ctx
+    update = FakeUpdate("/start")
+
+    await start(update, context)
+
+    labels = keyboard_labels(update.message.reply_markups[0])
+    assert BTN_NEW_WALLET in labels
+    assert BTN_WALLETS not in labels
+    assert BTN_DAILY_REPORT in labels
+
+
+@pytest.mark.asyncio
+async def test_start_menu_uses_wallet_management_when_user_has_wallet(handler_ctx) -> None:
+    _, session_factory, _, _, _, context = handler_ctx
+    with session_scope(session_factory) as session:
+        WalletService(session).add_wallet(
+            telegram_user_id=1,
+            telegram_chat_id=100,
+            address="0x0e712f06daeab2e866b1477923764af2fc1a9f67",
+            chain="robinhood",
+        )
+    update = FakeUpdate("/start")
+
+    await start(update, context)
+
+    labels = keyboard_labels(update.message.reply_markups[0])
+    assert BTN_WALLETS in labels
+    assert BTN_NEW_WALLET not in labels
+
+
+@pytest.mark.asyncio
+async def test_new_wallet_button_enters_add_wallet_flow(handler_ctx) -> None:
+    _, _, _, _, _, context = handler_ctx
+    update = FakeUpdate(BTN_NEW_WALLET)
+
+    state = await add_wallet_start(update, context)
+
+    assert state == ADDING_WALLET
+    assert update.message.replies == ["请输入需要监控的钱包地址："]
+
+
+@pytest.mark.asyncio
+async def test_add_wallet_success_menu_switches_to_wallet_management(handler_ctx) -> None:
+    _, _, _, _, _, context = handler_ctx
+    update = FakeUpdate("0x0e712f06daeab2e866b1477923764af2fc1a9f67")
+
+    await add_wallet_finish(update, context)
+    await context.application.tasks[0]
+
+    labels = keyboard_labels(update.message.reply_markups[0])
+    assert BTN_WALLETS in labels
+    assert BTN_NEW_WALLET not in labels
+
+
+@pytest.mark.asyncio
+async def test_delete_last_wallet_menu_switches_to_new_wallet(handler_ctx) -> None:
+    _, session_factory, _, _, _, context = handler_ctx
+    with session_scope(session_factory) as session:
+        WalletService(session).add_wallet(
+            telegram_user_id=1,
+            telegram_chat_id=100,
+            address="0x0e712f06daeab2e866b1477923764af2fc1a9f67",
+            chain="robinhood",
+        )
+    update = FakeUpdate("0x0e712f06daeab2e866b1477923764af2fc1a9f67")
+
+    await delete_wallet_finish(update, context)
+
+    labels = keyboard_labels(update.message.reply_markups[0])
+    assert BTN_NEW_WALLET in labels
+    assert BTN_WALLETS not in labels
+
+
+@pytest.mark.asyncio
+async def test_delete_one_wallet_but_keep_another_still_shows_wallet_management(handler_ctx) -> None:
+    _, session_factory, _, _, _, context = handler_ctx
+    with session_scope(session_factory) as session:
+        WalletService(session).add_wallet(
+            telegram_user_id=1,
+            telegram_chat_id=100,
+            address="0x0e712f06daeab2e866b1477923764af2fc1a9f67",
+            chain="robinhood",
+        )
+        WalletService(session).add_wallet(
+            telegram_user_id=1,
+            telegram_chat_id=100,
+            address="0x1111111111111111111111111111111111111111",
+            chain="robinhood",
+        )
+    update = FakeUpdate("0x0e712f06daeab2e866b1477923764af2fc1a9f67")
+
+    await delete_wallet_finish(update, context)
+
+    labels = keyboard_labels(update.message.reply_markups[0])
+    assert BTN_WALLETS in labels
+    assert BTN_NEW_WALLET not in labels
+    assert BTN_ADD_WALLET != BTN_NEW_WALLET
 
 
 @pytest.mark.asyncio

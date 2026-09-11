@@ -16,6 +16,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import sessionmaker
 from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
+from app.bot.formatters import format_market_cap
 from app.core.config import Settings
 from app.db.database import session_scope
 from app.db.models import (
@@ -37,6 +38,7 @@ from app.services.gmgn_client import (
     GmgnTokenOverview,
     GmgnTrackTrade,
 )
+from app.services.holding_market_cap import HoldingMarketContext, HoldingMarketContextCache
 from app.services.price_quality import PRICE_QUALITY_VALID
 from app.services.social_event_service import SocialEventService
 from app.services.social_identity_service import SocialIdentityService
@@ -58,6 +60,8 @@ HOLDER_COUNT_WINDOW_MINUTES = 30
 LIQUIDITY_WINDOW_MINUTES = 60
 TOP10_DISPLAY_MIN_ABS_CHANGE_PCT = Decimal("10")
 TOP10_DISPLAY_MAX_WINDOW_MINUTES = 60
+CONTINUED_EXTREME_PRICE_MOVE_THRESHOLD_PCT = Decimal("50")
+CONTINUED_EXTREME_PRICE_MOVE_COOLDOWN_MINUTES = 15
 
 MARKET_EXPANSION = "market_expansion"
 MINORITY_DRIVEN = "minority_driven"
@@ -99,6 +103,13 @@ class AttentionRunResult:
         if self.errors is None:
             self.errors = []
         self.errors.append(str(error))
+
+
+@dataclass(frozen=True)
+class NotificationDecision:
+    should_notify: bool
+    reason: str
+    notification_context: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -208,6 +219,7 @@ class AttentionEngineService:
         social_identity_service: SocialIdentityService | None = None,
         social_event_service: SocialEventService | None = None,
         social_memory_service: SocialMemoryService | None = None,
+        market_context_cache: HoldingMarketContextCache | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gmgn_client = gmgn_client
@@ -216,6 +228,7 @@ class AttentionEngineService:
         self.social_identity_service = social_identity_service or SocialIdentityService(session_factory)
         self.social_event_service = social_event_service
         self.social_memory_service = social_memory_service
+        self.market_context_cache = market_context_cache or HoldingMarketContextCache()
         self._notification_locks: dict[tuple[int, str], asyncio.Lock] = {}
 
     def set_social_services(
@@ -437,6 +450,13 @@ class AttentionEngineService:
                 },
                 direction,
             )
+            market_context = self.market_context_cache.get(
+                wallet_id,
+                token_address,
+                watch_started_at=watched.watch_started_at,
+                now=now,
+                max_age_seconds=180,
+            )
             evidence = self._evidence(
                 session,
                 wallet_id,
@@ -454,8 +474,31 @@ class AttentionEngineService:
                 primary_signal,
                 social_fact,
                 dev_modifier_reason,
+                market_context,
             )
-            should_notify = self._should_notify(session, wallet_id, token_address, level, final, direction, family_scores, now)
+            notification_decision = self._notification_decision(
+                session,
+                wallet_id,
+                token_address,
+                level,
+                final,
+                direction,
+                family_scores,
+                now,
+                current_price_usd=_decimal_or_none(latest_price.price_usd) if latest_price else None,
+                watch_started_at=watched.watch_started_at,
+            )
+            evidence["notification_context"] = notification_decision.notification_context
+            should_notify = notification_decision.should_notify
+            if level in {scoring.WARNING, scoring.CRITICAL}:
+                logger.info(
+                    "Attention notification decision wallet_id=%s token=%s score=%s level=%s reason=%s",
+                    wallet_id,
+                    token_address,
+                    final,
+                    level,
+                    notification_decision.reason,
+                )
             assessment = AttentionAssessment(
                 wallet_id=wallet_id,
                 token_address=token_address,
@@ -1809,6 +1852,7 @@ class AttentionEngineService:
         primary_signal: str | None = None,
         social_fact: SocialAttentionFact | None = None,
         dev_modifier_reason: str | None = None,
+        market_context: HoldingMarketContext | None = None,
     ) -> dict[str, Any]:
         cutoff = utc_now() - timedelta(minutes=self.settings.attention_event_aggregation_minutes)
         if watch_started_at is not None:
@@ -1849,6 +1893,7 @@ class AttentionEngineService:
             "family_scores": family_scores,
             "social": social_fact.to_dict() if social_fact else None,
             "dev_modifier_reason": dev_modifier_reason,
+            "market_cap_context": market_context.to_dict() if market_context else None,
             "display_facts": display_facts,
             "position_intelligence": position_intelligence.to_dict(),
             "price_change_pct": str(price_change) if price_change is not None else None,
@@ -1927,9 +1972,45 @@ class AttentionEngineService:
         direction: str,
         family_scores: dict[str, int],
         now: datetime,
+        *,
+        current_price_usd: Decimal | None = None,
+        watch_started_at: datetime | None = None,
     ) -> bool:
+        return self._notification_decision(
+            session,
+            wallet_id,
+            token_address,
+            level,
+            final_score,
+            direction,
+            family_scores,
+            now,
+            current_price_usd=current_price_usd,
+            watch_started_at=watch_started_at,
+        ).should_notify
+
+    def _notification_decision(
+        self,
+        session,
+        wallet_id: int,
+        token_address: str,
+        level: str,
+        final_score: int,
+        direction: str,
+        family_scores: dict[str, int],
+        now: datetime,
+        *,
+        current_price_usd: Decimal | None = None,
+        watch_started_at: datetime | None = None,
+    ) -> NotificationDecision:
+        context = {
+            "current_price_usd": str(current_price_usd) if current_price_usd is not None else None,
+            "last_notified_price_usd": None,
+            "price_change_since_last_notification_pct": None,
+            "continued_extreme_price_move": False,
+        }
         if level not in {scoring.WARNING, scoring.CRITICAL}:
-            return False
+            return NotificationDecision(False, "below_warning", context)
         state = session.scalar(
             select(AttentionAlertState).where(
                 AttentionAlertState.wallet_id == wallet_id,
@@ -1937,19 +2018,72 @@ class AttentionEngineService:
             )
         )
         if not state or not state.last_notified_at:
-            return True
+            return NotificationDecision(True, "no_previous_alert", context)
         previous_scores = _json_loads(state.family_scores_json)
+        state_meta = _notification_state_meta(previous_scores)
+        extreme_context = self._continued_extreme_price_context(
+            state_meta,
+            current_price_usd,
+            watch_started_at,
+            now,
+            level,
+            family_scores,
+        )
+        context.update(extreme_context)
         if state.last_attention_level == scoring.WARNING and level == scoring.CRITICAL:
-            return True
+            return NotificationDecision(True, "level_escalation", context)
         if state.last_final_score is not None and final_score - state.last_final_score >= 15:
-            return True
+            return NotificationDecision(True, "score_jump", context)
         if state.last_direction and state.last_direction != direction and direction != scoring.NEUTRAL:
-            return True
+            return NotificationDecision(True, "direction_change", context)
         if _has_new_strong_family(previous_scores, family_scores):
-            return True
+            return NotificationDecision(True, "new_strong_family", context)
+        if context["continued_extreme_price_move"]:
+            return NotificationDecision(True, "continued_extreme_price_move", context)
         if level == scoring.CRITICAL:
-            return now - state.last_notified_at >= timedelta(minutes=self.settings.attention_critical_cooldown_minutes)
-        return now - state.last_notified_at >= timedelta(minutes=self.settings.attention_warning_cooldown_minutes)
+            if now - state.last_notified_at >= timedelta(minutes=self.settings.attention_critical_cooldown_minutes):
+                return NotificationDecision(True, "critical_cooldown_expired", context)
+            return NotificationDecision(False, "critical_cooldown", context)
+        if now - state.last_notified_at >= timedelta(minutes=self.settings.attention_warning_cooldown_minutes):
+            return NotificationDecision(True, "warning_cooldown_expired", context)
+        return NotificationDecision(False, "warning_cooldown", context)
+
+    def _continued_extreme_price_context(
+        self,
+        state_meta: dict[str, Any],
+        current_price_usd: Decimal | None,
+        watch_started_at: datetime | None,
+        now: datetime,
+        level: str,
+        family_scores: dict[str, int],
+    ) -> dict[str, Any]:
+        context = {
+            "current_price_usd": str(current_price_usd) if current_price_usd is not None else None,
+            "last_notified_price_usd": None,
+            "price_change_since_last_notification_pct": None,
+            "continued_extreme_price_move": False,
+        }
+        if level != scoring.CRITICAL:
+            return context
+        if int(family_scores.get(scoring.PRICE, 0) or 0) != 40:
+            return context
+        if not _same_watch_started_at(state_meta.get("watch_started_at"), watch_started_at):
+            return context
+        previous_price = _decimal_or_none(state_meta.get("last_notified_price_usd"))
+        if previous_price is None or previous_price <= 0:
+            return context
+        context["last_notified_price_usd"] = str(previous_price)
+        if current_price_usd is None or current_price_usd <= 0:
+            return context
+        change_pct = ((current_price_usd / previous_price) - Decimal("1")) * Decimal("100")
+        context["price_change_since_last_notification_pct"] = str(change_pct)
+        if abs(change_pct) < CONTINUED_EXTREME_PRICE_MOVE_THRESHOLD_PCT:
+            return context
+        last_extreme_at = _parse_iso_datetime(state_meta.get("last_extreme_price_notified_at"))
+        if last_extreme_at and now - last_extreme_at < timedelta(minutes=CONTINUED_EXTREME_PRICE_MOVE_COOLDOWN_MINUTES):
+            return context
+        context["continued_extreme_price_move"] = True
+        return context
 
     async def _notify_assessment(self, assessment: AttentionAssessment) -> bool:
         if not self.notifier:
@@ -1968,7 +2102,7 @@ class AttentionEngineService:
                         assessment.assessed_at,
                     )
                     return False
-                if not self._should_notify(
+                notification_decision = self._notification_decision(
                     session,
                     assessment.wallet_id,
                     assessment.token_address,
@@ -1977,15 +2111,28 @@ class AttentionEngineService:
                     assessment.direction,
                     _family_scores_from_assessment(assessment),
                     utc_now(),
-                ):
+                    current_price_usd=_assessment_current_price_usd(assessment),
+                    watch_started_at=self._current_watch_started_at(session, assessment.wallet_id, assessment.token_address),
+                )
+                if not notification_decision.should_notify:
                     logger.info(
-                        "Attention notification suppressed after serialized recheck wallet_id=%s token=%s score=%s level=%s",
+                        "Attention notification suppressed after serialized recheck wallet_id=%s token=%s score=%s level=%s reason=%s",
                         assessment.wallet_id,
                         assessment.token_address,
                         assessment.final_attention_score,
                         assessment.attention_level,
+                        notification_decision.reason,
                     )
                     return False
+                logger.info(
+                    "Attention notification allowed after serialized recheck wallet_id=%s token=%s score=%s level=%s reason=%s price_change_since_last_notification=%s",
+                    assessment.wallet_id,
+                    assessment.token_address,
+                    assessment.final_attention_score,
+                    assessment.attention_level,
+                    notification_decision.reason,
+                    notification_decision.notification_context.get("price_change_since_last_notification_pct"),
+                )
                 chat_id = wallet.user.telegram_chat_id
             await self._send_notification_with_retry(
                 chat_id,
@@ -1993,7 +2140,7 @@ class AttentionEngineService:
                 assessment,
                 build_attention_copy_markup(assessment),
             )
-            if not self._mark_notified(assessment):
+            if not self._mark_notified(assessment, notification_decision.reason):
                 logger.info(
                     "Attention notification delivered but mark skipped stale assessment wallet_id=%s token=%s",
                     assessment.wallet_id,
@@ -2056,9 +2203,10 @@ class AttentionEngineService:
             return
         await self.notifier(chat_id, text)
 
-    def _mark_notified(self, assessment: AttentionAssessment) -> bool:
+    def _mark_notified(self, assessment: AttentionAssessment, notification_reason: str | None = None) -> bool:
         with session_scope(self.session_factory) as session:
-            if not self._assessment_matches_current_watch(session, assessment):
+            watch_started_at = self._current_watch_started_at(session, assessment.wallet_id, assessment.token_address)
+            if not watch_started_at or assessment.assessed_at < watch_started_at:
                 return False
             state = session.scalar(
                 select(AttentionAlertState).where(
@@ -2076,18 +2224,31 @@ class AttentionEngineService:
             state.last_attention_level = assessment.attention_level
             state.last_final_score = assessment.final_attention_score
             state.last_direction = assessment.direction
-            state.family_scores_json = json.dumps(_family_scores_from_assessment(assessment), ensure_ascii=False)
+            previous_meta = _notification_state_meta(_json_loads(state.family_scores_json))
+            state.family_scores_json = json.dumps(
+                _family_scores_with_notification_meta(
+                    assessment,
+                    previous_meta,
+                    watch_started_at,
+                    notification_reason,
+                    state.last_notified_at,
+                ),
+                ensure_ascii=False,
+            )
             return True
 
     def _assessment_matches_current_watch(self, session, assessment: AttentionAssessment) -> bool:
-        started_at = session.scalar(
+        started_at = self._current_watch_started_at(session, assessment.wallet_id, assessment.token_address)
+        return bool(started_at and assessment.assessed_at >= started_at)
+
+    def _current_watch_started_at(self, session, wallet_id: int, token_address: str) -> datetime | None:
+        return session.scalar(
             select(TokenWatchState.started_at).where(
-                TokenWatchState.wallet_id == assessment.wallet_id,
-                TokenWatchState.token_address == assessment.token_address,
+                TokenWatchState.wallet_id == wallet_id,
+                TokenWatchState.token_address == token_address,
                 TokenWatchState.active.is_(True),
             )
         )
-        return bool(started_at and assessment.assessed_at >= started_at)
 
     async def cleanup_old_snapshots(self) -> None:
         cutoff = utc_now() - timedelta(days=7)
@@ -2118,13 +2279,18 @@ def format_attention_alert(assessment: AttentionAssessment) -> str:
         evidence.get("assessment_trigger"),
         evidence.get("primary_signal"),
     )
-    lines = [
-        f"{emoji} {symbol}",
-        "",
-        f"{trigger_title}｜{_direction_label(assessment.direction)}｜ATT {assessment.final_attention_score}",
-        "",
-        "近况：",
-    ]
+    lines = [f"{emoji} {symbol}"]
+    market_cap_line = _market_cap_context_line(evidence.get("market_cap_context"))
+    if market_cap_line:
+        lines.append(market_cap_line)
+    lines.extend(
+        [
+            "",
+            f"{trigger_title}｜{_direction_label(assessment.direction)}｜ATT {assessment.final_attention_score}",
+            "",
+            "近况：",
+        ]
+    )
     for fact_line in _display_fact_lines(evidence.get("display_facts")):
         lines.append(fact_line)
     position_intelligence = evidence.get("position_intelligence")
@@ -2135,13 +2301,19 @@ def format_attention_alert(assessment: AttentionAssessment) -> str:
                 f"判断：{position_intelligence['summary']}",
             ]
         )
-    lines.extend(
-        [
-            "",
-            "当前仅提示异动事实，不构成交易建议。",
-        ]
-    )
     return "\n".join(lines)
+
+
+def _market_cap_context_line(context: Any) -> str | None:
+    if not isinstance(context, dict):
+        return None
+    current = context.get("current_market_cap_usd")
+    if current in (None, ""):
+        return None
+    return (
+        f"持仓市值：{format_market_cap(context.get('entry_market_cap_usd'))}"
+        f" ｜ 当前市值：{format_market_cap(current)}"
+    )
 
 
 def _direction_emoji(direction: str | None) -> str:
@@ -2473,6 +2645,56 @@ def _json_loads(value: str | None) -> dict[str, Any]:
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _notification_state_meta(state_json: dict[str, Any]) -> dict[str, Any]:
+    meta = state_json.get("_meta") if isinstance(state_json, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _assessment_current_price_usd(assessment: AttentionAssessment) -> Decimal | None:
+    evidence = _json_loads(assessment.evidence_json)
+    notification_context = evidence.get("notification_context")
+    if isinstance(notification_context, dict):
+        price = _decimal_or_none(notification_context.get("current_price_usd"))
+        if price is not None:
+            return price
+    return _decimal_or_none(evidence.get("current_price"))
+
+
+def _family_scores_with_notification_meta(
+    assessment: AttentionAssessment,
+    previous_meta: dict[str, Any],
+    watch_started_at: datetime,
+    notification_reason: str | None,
+    notified_at: datetime | None,
+) -> dict[str, Any]:
+    scores: dict[str, Any] = _family_scores_from_assessment(assessment)
+    meta = dict(previous_meta) if _same_watch_started_at(previous_meta.get("watch_started_at"), watch_started_at) else {}
+    current_price = _assessment_current_price_usd(assessment)
+    if current_price is not None and current_price > 0:
+        meta["last_notified_price_usd"] = str(current_price)
+    if notification_reason == "continued_extreme_price_move" and notified_at is not None:
+        meta["last_extreme_price_notified_at"] = notified_at.isoformat()
+    meta["watch_started_at"] = watch_started_at.isoformat()
+    scores["_meta"] = meta
+    return scores
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _same_watch_started_at(meta_value: Any, watch_started_at: datetime | None) -> bool:
+    if watch_started_at is None:
+        return False
+    parsed = _parse_iso_datetime(meta_value)
+    return parsed == watch_started_at
 
 
 def _has_new_strong_family(previous_scores: dict[str, Any], current_scores: dict[str, int]) -> bool:

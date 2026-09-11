@@ -28,6 +28,10 @@ from app.services.holding_classifier import (
     is_display_position,
     is_trading_position,
 )
+from app.services.holding_market_cap import (
+    HoldingMarketContextCache,
+    build_holding_market_context,
+)
 from app.services.price_quality import (
     PRICE_QUALITY_OUTLIER,
     PRICE_QUALITY_PENDING,
@@ -109,12 +113,14 @@ class PriceGuardianService:
         settings: Settings,
         notifier: Notifier | None = None,
         price_attention_trigger: PriceAttentionTrigger | None = None,
+        market_context_cache: HoldingMarketContextCache | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gmgn_client = gmgn_client
         self.settings = settings
         self.notifier = notifier
         self.price_attention_trigger = price_attention_trigger
+        self.market_context_cache = market_context_cache or HoldingMarketContextCache()
         self._scan_lock = asyncio.Lock()
         self._wallet_semaphore = asyncio.Semaphore(max(settings.price_wallet_concurrency, 1))
         self._wallet_locks: dict[int, asyncio.Lock] = {}
@@ -274,6 +280,17 @@ class PriceGuardianService:
                 session.add(snapshot)
                 result.snapshots_saved += 1
                 if snapshot.quality_status == PRICE_QUALITY_VALID:
+                    context = build_holding_market_context(
+                        wallet_id=wallet.id,
+                        token_address=holding.contract_address,
+                        holding=holding,
+                        observed_at=now,
+                        watch_started_at=watch_state.started_at,
+                    )
+                    if context:
+                        self.market_context_cache.set(context)
+                    else:
+                        self.market_context_cache.delete(wallet.id, holding.contract_address)
                     key = (wallet.id, holding.contract_address)
                     price_attention_tokens[key] = price_attention_tokens.get(key, False) or (
                         quality_result.resolved_pending
